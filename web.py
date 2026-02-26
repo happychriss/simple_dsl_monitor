@@ -216,7 +216,7 @@ INDEX_HTML = """<!doctype html>
         lastEl.textContent = d.toLocaleString();
       }
 
-      const times = data.points.map(p => p.timestamp);
+      const times = data.points.map(p => new Date(p.timestamp));
       const latencies = data.points.map(p => p.latency_ms);
       const colors = data.points.map(p => {
         if (p.status === 'outage') return '#f56565';
@@ -394,7 +394,14 @@ INDEX_HTML = """<!doctype html>
 
 def _bucket_start(ts: datetime, minutes: int = 5) -> datetime:
     minutes_since_hour = (ts.minute // minutes) * minutes
-    return ts.replace(minute=minutes_since_hour, second=0, microsecond=0)
+    out = ts.replace(minute=minutes_since_hour, second=0, microsecond=0)
+    # Always return timezone-aware UTC timestamps so the frontend can display
+    # everything consistently in the browser's local timezone.
+    if out.tzinfo is None:
+        out = out.replace(tzinfo=timezone.utc)
+    else:
+        out = out.astimezone(timezone.utc)
+    return out
 
 
 def _parse_bool01(value: str | None) -> bool:
