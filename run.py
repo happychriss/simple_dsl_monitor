@@ -39,8 +39,15 @@ def _env_flag(name: str, default: str = "1") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _start(cmd: List[str], env: dict[str, str] | None = None) -> subprocess.Popen[str]:
-    return subprocess.Popen(cmd, text=True, env=env)
+def _start(cmd: List[str], env: dict[str, str] | None = None, cwd: str | None = None) -> subprocess.Popen[str]:
+    # Use inherited stdio by default (None), which works reliably across IDE/systemd.
+    return subprocess.Popen(
+        cmd,
+        text=True,
+        env=env,
+        cwd=cwd,
+        start_new_session=True,
+    )
 
 
 def main() -> int:
@@ -53,12 +60,16 @@ def main() -> int:
 
     # Optional Fritz status bridge
     if _env_flag("DSL_MONITOR_START_FRITZ_BRIDGE", "1"):
-        print("Starting fritz_status_service.py  endpoint:", os.environ.get("DSL_CONN_STATUS_URL", "http://127.0.0.1:9077/status"), flush=True)
-        procs.append(_start([sys.executable, os.path.join(here, "fritz_status_service.py")]))
+        print(
+            "Starting fritz_status_service.py – endpoint:",
+            os.environ.get("DSL_CONN_STATUS_URL", "http://127.0.0.1:9077/status"),
+            flush=True,
+        )
+        procs.append(_start([sys.executable, os.path.join(here, "fritz_status_service.py")], cwd=here))
 
     # Probe (long running)
-    print("Starting probe.py  log:", os.environ.get("DSL_MONITOR_LOG", "(default)"), flush=True)
-    procs.append(_start([sys.executable, os.path.join(here, "probe.py")]))
+    print("Starting probe.py – log:", os.environ.get("DSL_MONITOR_LOG", "(default)"), flush=True)
+    procs.append(_start([sys.executable, os.path.join(here, "probe.py")], cwd=here))
 
     # Web UI: support the .env style variables DSL_MONITOR_WEB_HOST/PORT by mapping them
     # to the variables web.py actually reads.
@@ -68,8 +79,8 @@ def main() -> int:
     if "DSL_MONITOR_WEB_HOST" in web_env and "HOST" not in web_env:
         web_env["HOST"] = str(web_env["DSL_MONITOR_WEB_HOST"])
 
-    print("Starting web.py  UI on:", f"http://{web_env.get('HOST','0.0.0.0')}:{web_env.get('PORT','8080')}", flush=True)
-    procs.append(_start([sys.executable, os.path.join(here, "web.py")], env=web_env))
+    print("Starting web.py – UI on:", f"http://{web_env.get('HOST','0.0.0.0')}:{web_env.get('PORT','8080')}", flush=True)
+    procs.append(_start([sys.executable, os.path.join(here, "web.py")], env=web_env, cwd=here))
 
     stopping = False
 
@@ -78,6 +89,7 @@ def main() -> int:
         if stopping:
             return
         stopping = True
+        print("run.py: stopping children…", flush=True)
         for p in procs:
             try:
                 p.terminate()
@@ -93,6 +105,7 @@ def main() -> int:
             for p in procs:
                 rc = p.poll()
                 if rc is not None:
+                    print(f"run.py: child exited pid={p.pid} rc={rc} cmd={getattr(p, 'args', '')}", flush=True)
                     _stop(signal.SIGTERM, None)
                     # give others a moment
                     time.sleep(2.0)
