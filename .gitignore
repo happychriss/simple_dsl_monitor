@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+.env/
+
+# Local config / secrets
+.env
+
+# Logs / runtime files
+dsl_log.csv
+*.log
+
+# IDE
+.idea/
+
+!/.env

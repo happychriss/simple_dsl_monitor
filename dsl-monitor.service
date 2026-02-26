@@ -1,0 +1,23 @@
+[Unit]
+Description=DSL monitor (run.py: fritz bridge + probe + web)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/development/Projects/Experiements/dsl_monitor
+# run.py startet fritz_status_service.py, probe.py und web.py
+ExecStart=/home/development/Projects/Experiements/dsl_monitor/.venv/bin/python3 /home/development/Projects/Experiements/dsl_monitor/run.py
+
+# .env wird von run.py aus dem WorkingDirectory geladen (python-dotenv).
+# Optionale Overrides (falls kein .env genutzt wird):
+# Environment=DSL_MONITOR_WEB_HOST=127.0.0.1
+# Environment=DSL_MONITOR_WEB_PORT=9076
+# Environment=FRITZ_STATUS_PORT=9077
+# Environment=DSL_CONN_STATUS_URL=http://127.0.0.1:9077/status
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
