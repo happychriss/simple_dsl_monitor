@@ -6,6 +6,22 @@ Ein kleines DSL/Verbindungs-Monitoring.
 - Konfiguration über `.env` (niemals committen).
 - Logs werden als CSV geschrieben (`dsl_log.csv`).
 
+## UI / Plots
+
+Die Web-UI zeigt zwei Plotly-Grafiken:
+
+1) **Ping-Latenz (oben)**
+   - Zeitreihe der Ping-Latenz (Buckets)
+   - Marker-Farben: **grün** = Ping OK, **rot** = Ping-Event/Outage (Bucket mit `dsl_event_active`)
+
+2) **Status-Boxen (unten, zweite Zeile)**
+   - Quadrate pro Zeit-Bucket als kompakte Statusanzeige
+   - Farben:
+     - **rot** = outage (Ping-Event im Bucket)
+     - **blau** = DSL
+     - **gelb** = mobile
+   - Wenn in einem Bucket kein Fritz-Status geloggt ist, wird **DSL angenommen** (damit „OK-Phasen“ sichtbar als DSL erscheinen).
+
 ## Was ist ein „DSL-Event“?
 
 Ein DSL-Event ist **der Zeitraum**, in dem wir aktiv Fritz-Synchron-/Verbindungstyp beobachten und in der UI „rot“ markieren.
@@ -22,6 +38,14 @@ Ein DSL-Event ist **der Zeitraum**, in dem wir aktiv Fritz-Synchron-/Verbindungs
 **Event-Ende:**
 - Sobald Fritz wieder `connection_type == dsl` meldet → Ende (`dsl_event_end_reason=recovered_to_dsl`).
 - Oder nach `DSL_MONITOR_DSL_EVENT_MAX_SECONDS` (Default 45min) → Ende (`dsl_event_end_reason=max_duration`).
+
+## Retention (Anzeige vs. CSV)
+
+- `DSL_MONITOR_RETENTION_DAYS` wirkt **nur auf die Anzeige** in der Web-UI (Filter beim Lesen/Aggregieren).
+- Die CSV (`dsl_log.csv`) bleibt **standardmäßig vollständig** (alle Messwerte, kein automatisches Löschen).
+- Optional kannst du explizites Pruning einschalten:
+  - `DSL_MONITOR_CSV_RETENTION_DAYS=<tage>`
+  - Default ist `0` (= unendlich / kein Pruning).
 
 ## CSV Schema (saubere Version)
 
@@ -84,3 +108,4 @@ Siehe `.env.example` (dort sind alle Keys inkl. Bedeutung dokumentiert). Wichtig
 - HTTP-Probe: `DSL_MONITOR_HTTP_PROBE_URL`, `DSL_MONITOR_HTTP_PROBE_INTERVAL_SECONDS`, `DSL_MONITOR_HTTP_PROBE_TIMEOUT_SECONDS`
 - Web: `DSL_MONITOR_WEB_HOST`, `DSL_MONITOR_WEB_PORT`
 - Orchestrator: `DSL_MONITOR_START_FRITZ_BRIDGE`
+- Optional CSV-Retention: `DSL_MONITOR_CSV_RETENTION_DAYS` (Default 0 = keep forever)

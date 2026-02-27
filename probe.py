@@ -32,7 +32,12 @@ LOG_PATH = os.environ.get(
     "DSL_MONITOR_LOG",
     os.path.join(os.path.dirname(__file__), "dsl_log.csv"),
 )
+
+# Retention for the web UI display only.
 RETENTION_DAYS = int(os.environ.get("DSL_MONITOR_RETENTION_DAYS", "7"))
+
+# CSV pruning retention (0/empty = keep forever)
+CSV_RETENTION_DAYS = int(os.environ.get("DSL_MONITOR_CSV_RETENTION_DAYS", "0"))
 
 PING_INTERVAL_SECONDS = int(os.environ.get("DSL_MONITOR_PING_INTERVAL_SECONDS", "15"))
 CONSECUTIVE_FAILURES_THRESHOLD = int(os.environ.get("DSL_MONITOR_FAILURE_THRESHOLD", "3"))
@@ -190,7 +195,11 @@ def append_and_prune_log(path: str, row: list) -> None:
     with open(path, "a", newline="") as f:
         csv.writer(f).writerow(row)
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
+    # Keep all measurements by default. Enable pruning explicitly via env var.
+    if CSV_RETENTION_DAYS <= 0:
+        return
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=CSV_RETENTION_DAYS)
 
     rows: list[list] = []
     with open(path, "r", newline="") as f:

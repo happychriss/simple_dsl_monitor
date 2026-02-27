@@ -60,8 +60,8 @@ INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1>DSL Stability Monitor v.0.1</h1>
-  <div class="subtitle">Last 7 days  ping probe every 10s, aggregated in 5minute buckets. Green = Ping OK  Red = Ping event (3x no response).</div>
+  <h1>DSL Stability Monitor v.0.2</h1>
+  <div class="subtitle">Last 7 days   ping probe every 10s, aggregated in 5minute buckets. Ping: green=OK, red=event. Status boxes: red=outage, blue=dsl, yellow=mobile.</div>
 
   <div style="margin-bottom: 0.75rem; font-size: 0.9rem; color: #ccc;">
     <span id="current-datetime"></span>
@@ -81,6 +81,7 @@ INDEX_HTML = """<!doctype html>
     Fritz mapping:
     <span style="display:inline-block; padding: 2px 8px; border-radius: 4px; background:#ecc94b; color:#111; margin-left: 0.5rem;">mobile</span>
     <span style="display:inline-block; padding: 2px 8px; border-radius: 4px; background:#63b3ed; color:#111; margin-left: 0.5rem;">dsl</span>
+    <span style="display:inline-block; padding: 2px 8px; border-radius: 4px; background:#f56565; color:#111; margin-left: 0.5rem;">outage</span>
   </div>
 
   <h2 style="margin-top:2rem;">Outage Events (last 7 days)</h2>
@@ -224,7 +225,7 @@ INDEX_HTML = """<!doctype html>
 
       const times = data.points.map(p => new Date(p.timestamp));
       const latencies = data.points.map(p => p.latency_ms);
-      const colors = data.points.map(p => {
+      const pingColors = data.points.map(p => {
         if (p.status === 'outage') return '#f56565';
         return '#48bb78';
       });
@@ -233,7 +234,7 @@ INDEX_HTML = """<!doctype html>
         x: times,
         y: latencies,
         mode: 'lines+markers',
-        marker: { color: colors, size: 6 },
+        marker: { color: pingColors, size: 6 },
         line: { color: '#63b3ed', width: 1 },
         name: `Ping latency (ms)  ${data.bucket_minutes} min buckets`
       };
@@ -249,22 +250,52 @@ INDEX_HTML = """<!doctype html>
 
       Plotly.newPlot('latency', [latencyTrace], latencyLayout, {responsive: true});
 
-      const statusTrace = {
-        x: times,
-        y: new Array(times.length).fill(1),
-        mode: 'markers',
-        marker: {
-          color: colors,
-          size: 10,
-          symbol: 'square'
-        },
-        hoverinfo: 'x+text',
-        text: data.points.map(p => {
-          if (p.status === 'outage') return `PING EVENT in bucket (max ${formatDuration(p.max_outage_duration_seconds)})`;
-          const avg = p.latency_ms != null ? p.latency_ms.toFixed(1) : 'n/a';
-          return `OK (avg ${avg} ms)`;
-        })
+      // --------------------------------------------------------------
+      // Status boxes: red=outage, blue=dsl, yellow=mobile.
+      // If there's no outage in a bucket, we default to DSL.
+      // --------------------------------------------------------------
+      const statusType = (p) => {
+        if (p.status === 'outage') return 'outage';
+        // backend sends connection_type (dsl/mobile/unknown). Unknown defaults to DSL.
+        const ct = (p.connection_type || 'unknown').toLowerCase();
+        if (ct === 'mobile') return 'mobile';
+        return 'dsl';
       };
+
+      const statusText = (p) => {
+        const avg = p.latency_ms != null ? p.latency_ms.toFixed(1) : 'n/a';
+        const t = statusType(p);
+        if (t === 'outage') return `OUTAGE (ping event)`;
+        if (t === 'mobile') return `MOBILE (avg ${avg} ms)`;
+        return `DSL (avg ${avg} ms)`;
+      };
+
+      const mkTrace = (label, color, predicate) => {
+        const x = [];
+        const y = [];
+        const text = [];
+        data.points.forEach((p) => {
+          if (!predicate(p)) return;
+          x.push(new Date(p.timestamp));
+          y.push(1);
+          text.push(statusText(p));
+        });
+        return {
+          x,
+          y,
+          mode: 'markers',
+          name: label,
+          marker: { color, size: 10, symbol: 'square' },
+          hoverinfo: 'x+text',
+          text,
+        };
+      };
+
+      const statusTraces = [
+        mkTrace('outage', '#f56565', (p) => statusType(p) === 'outage'),
+        mkTrace('dsl', '#63b3ed', (p) => statusType(p) === 'dsl'),
+        mkTrace('mobile', '#ecc94b', (p) => statusType(p) === 'mobile'),
+      ];
 
       const statusLayout = {
         paper_bgcolor: '#111',
@@ -273,10 +304,12 @@ INDEX_HTML = """<!doctype html>
         xaxis: { showgrid: false, zeroline: false, showticklabels: true },
         yaxis: { showgrid: false, zeroline: false, showticklabels: false },
         margin: { t: 20, r: 10, b: 40, l: 40 },
-        height: 120
+        height: 120,
+        showlegend: true,
+        legend: { orientation: 'h', x: 0, y: 1.2 }
       };
 
-      Plotly.newPlot('status', [statusTrace], statusLayout, {responsive: true});
+      Plotly.newPlot('status', statusTraces, statusLayout, {responsive: true});
 
       const tbody = document.querySelector('#events-table tbody');
       tbody.innerHTML = '';
@@ -478,6 +511,8 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
                 "lat_sum": 0.0,
                 "lat_count": 0,
                 "has_outage": False,
+                "has_mobile": False,
+                "has_dsl": False,
             },
         )
 
@@ -488,6 +523,12 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         if p.get("dsl_event_active"):
             b["has_outage"] = True
 
+        ct = str(p.get("connection_type") or "unknown").lower()
+        if ct == "mobile":
+            b["has_mobile"] = True
+        elif ct == "dsl":
+            b["has_dsl"] = True
+
     agg_points: List[Dict[str, Any]] = []
     for ts in sorted(buckets.keys()):
         b = buckets[ts]
@@ -495,11 +536,21 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
 
         status = "outage" if b["has_outage"] else "ok"
 
+        # Pick a representative connection type for the bucket.
+        # If we have no Fritz info in the CSV for that bucket, we default to DSL.
+        if b["has_mobile"]:
+            bucket_ct = "mobile"
+        elif b["has_dsl"]:
+            bucket_ct = "dsl"
+        else:
+            bucket_ct = "dsl"
+
         agg_points.append(
             {
                 "timestamp": ts.isoformat(),
                 "latency_ms": lat,
                 "status": status,
+                "connection_type": bucket_ct,
                 "max_outage_duration_seconds": None,
                 "max_mobile_duration_seconds": None,
             }
