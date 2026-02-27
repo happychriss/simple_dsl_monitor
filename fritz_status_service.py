@@ -19,6 +19,39 @@ FRITZ_PASSWORD = os.environ.get("FRITZ_PASSWORD", "")
 
 app = Flask(__name__)
 
+# Global cache for the FritzConnection instance (per process).
+_fc_cache: Any | None = None
+
+
+def _get_fritzconnection() -> Any:
+    """Return a cached FritzConnection instance.
+
+    FritzConnection creation can be relatively slow (TR-064 service discovery, etc.).
+    Caching makes /status faster and also reduces load on the FritzBox.
+
+    We keep this intentionally simple: single instance per process.
+    """
+
+    global _fc_cache
+
+    if FritzConnection is None:
+        raise RuntimeError("fritzconnection not installed")
+
+    if _fc_cache is None:
+        fritz_cls = cast(object, FritzConnection)
+        _fc_cache = cast(Any, fritz_cls)(
+            address=FRITZ_HOST,
+            user=FRITZ_USER or None,
+            password=FRITZ_PASSWORD or None,
+        )
+
+    return _fc_cache
+
+
+def _invalidate_fritzconnection_cache() -> None:
+    global _fc_cache
+    _fc_cache = None
+
 
 def _map_wan_access_type(raw: str) -> ConnectionType:
     raw_upper = raw.upper()
@@ -29,19 +62,43 @@ def _map_wan_access_type(raw: str) -> ConnectionType:
     return "unknown"
 
 
-def _query_fritzbox_connection_type() -> tuple[ConnectionType, str]:
-    if FritzConnection is None:
-        raise RuntimeError("fritzconnection not installed")
+def _iter_service_variants(service: str) -> list[str]:
+    """Return likely TR-064 service name variants.
 
-    fritz_cls = cast(object, FritzConnection)
-    fc = cast(Any, fritz_cls)(address=FRITZ_HOST, user=FRITZ_USER or None, password=FRITZ_PASSWORD or None)
-    resp = fc.call_action("WANCommonInterfaceConfig", "GetCommonLinkProperties")
-    raw = str(resp.get("NewWANAccessType", ""))
+    Some boxes require an explicit version suffix like ':1'. Others accept the
+    plain service name.
+    """
+
+    svc = service.strip()
+    if not svc:
+        return []
+    if ":" in svc:
+        base = svc.split(":", 1)[0]
+        return [svc, base]
+    return [f"{svc}:1", svc]
+
+
+def _call_action_with_variants(fc: Any, service: str, action: str) -> Any:
+    last_exc: Exception | None = None
+    for svc in _iter_service_variants(service):
+        try:
+            return fc.call_action(svc, action)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            continue
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("invalid service")
+
+
+def _query_fritzbox_connection_type(fc: Any) -> tuple[ConnectionType, str]:
+    resp = _call_action_with_variants(fc, "WANCommonInterfaceConfig", "GetCommonLinkProperties")
+    raw = str(getattr(resp, "get", lambda *_: "")("NewWANAccessType", ""))
     mapped = _map_wan_access_type(raw)
     return mapped, raw
 
 
-def _query_dsl_sync_status() -> Optional[dict[str, Any]]:
+def _query_dsl_sync_status(fc: Any) -> Optional[dict[str, Any]]:
     """Try to query DSL sync status via TR-064.
 
     Fritz!Box firmwares differ a lot. We try a small set of actions and return
@@ -49,12 +106,6 @@ def _query_dsl_sync_status() -> Optional[dict[str, Any]]:
 
     Returns None if not available.
     """
-
-    if FritzConnection is None:
-        return None
-
-    fritz_cls = cast(object, FritzConnection)
-    fc = cast(Any, fritz_cls)(address=FRITZ_HOST, user=FRITZ_USER or None, password=FRITZ_PASSWORD or None)
 
     # Most common service/action names seen in the wild.
     candidates: list[tuple[str, str]] = [
@@ -65,15 +116,15 @@ def _query_dsl_sync_status() -> Optional[dict[str, Any]]:
 
     for service, action in candidates:
         try:
-            resp = fc.call_action(service, action)
+            resp = _call_action_with_variants(fc, service, action)
         except Exception:
             continue
 
-        # Heuristic mapping to a stable payload.
-        payload: dict[str, Any] = {"service": service, "action": action}
+        if not isinstance(resp, dict):
+            continue
 
-        if isinstance(resp, dict):
-            payload.update(resp)
+        # Heuristic mapping to a stable payload.
+        payload: dict[str, Any] = {"service": service, "action": action, **resp}
 
         # Try to infer "sync up" from common fields.
         sync_up: Optional[bool] = None
@@ -90,14 +141,17 @@ def _query_dsl_sync_status() -> Optional[dict[str, Any]]:
                     sync_up = False
 
         # Some firmwares expose rates.
-        downstream = payload.get("NewDownstreamCurrRate") or payload.get("NewDownstreamMaxRate")
-        upstream = payload.get("NewUpstreamCurrRate") or payload.get("NewUpstreamMaxRate")
+        if sync_up is None:
+            downstream = payload.get("NewDownstreamCurrRate") or payload.get("NewDownstreamMaxRate")
+            upstream = payload.get("NewUpstreamCurrRate") or payload.get("NewUpstreamMaxRate")
 
-        if sync_up is None and (downstream is not None or upstream is not None):
-            try:
-                sync_up = (int(downstream or 0) > 0) or (int(upstream or 0) > 0)
-            except Exception:
-                pass
+            if (downstream is not None) or (upstream is not None):
+                try:
+                    ds = 0 if downstream is None else int(downstream)
+                    us = 0 if upstream is None else int(upstream)
+                    sync_up = (ds > 0) or (us > 0)
+                except Exception:
+                    pass
 
         if sync_up is not None:
             return {
@@ -131,12 +185,16 @@ def status():
     error: Optional[str] = None
 
     try:
-        conn_type, raw_access = _query_fritzbox_connection_type()
-        dsl = _query_dsl_sync_status()
+        fc = _get_fritzconnection()
+        conn_type, raw_access = _query_fritzbox_connection_type(fc)
+        dsl = _query_dsl_sync_status(fc)
         if dsl is not None:
             dsl_sync_up = cast(Optional[bool], dsl.get("sync_up"))
             dsl_sync_source = f"{dsl.get('service')}.{dsl.get('action')}"
     except Exception as exc:  # noqa: BLE001
+        # Connection caching can get stale if the box drops TR-064 sessions.
+        # Invalidate once so the next request can re-create a working instance.
+        _invalidate_fritzconnection_cache()
         error = str(exc)
 
     payload: dict[str, Any] = {

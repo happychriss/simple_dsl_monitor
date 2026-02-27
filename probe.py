@@ -43,6 +43,12 @@ CONN_STATUS_URL = os.environ.get("DSL_CONN_STATUS_URL", "http://127.0.0.1:9077/s
 ConnectionType = Literal["dsl", "mobile", "unknown"]
 CONN_TYPE_POLL_INTERVAL_SECONDS = int(os.environ.get("DSL_MONITOR_CONN_TYPE_POLL_INTERVAL_SECONDS", "60"))
 
+# Holdoff window after a DSL event ends.
+# Rationale: ping can flap during recovery (short OK streaks). If we reset the Fritz poll cache
+# immediately on every ping_ok tick, the next failure would trigger an immediate /status fetch,
+# effectively hammering the Fritz status bridge. Keeping the cache for a short time avoids that.
+CONN_TYPE_CACHE_HOLDOFF_SECONDS = int(os.environ.get("DSL_MONITOR_CONN_TYPE_CACHE_HOLDOFF_SECONDS", "120"))
+
 MOBILE_YELLOW_THRESHOLD_SECONDS = int(os.environ.get("DSL_MONITOR_MOBILE_YELLOW_THRESHOLD_SECONDS", "300"))
 
 # Generic HTTP probe (configurable URL)
@@ -264,11 +270,32 @@ def get_fritz_status() -> dict:
 _conn_type_last_fetch_mono: float = 0.0
 _conn_type_last_value: ConnectionType = "unknown"
 
+# Timestamp (monotonic) of the last time we observed an active DSL event.
+_dsl_event_last_active_mono: float = 0.0
+
+
+def mark_dsl_event_active_now() -> None:
+    """Mark that a DSL event is currently active (monotonic timestamp).
+
+    This is used to avoid resetting the Fritz polling cache immediately when ping state flaps.
+    """
+
+    global _dsl_event_last_active_mono
+    _dsl_event_last_active_mono = time.monotonic()
+
 
 def get_connection_type_if_outage(in_outage: bool) -> ConnectionType:
     global _conn_type_last_fetch_mono, _conn_type_last_value
 
     if not in_outage:
+        # Don't reset the Fritz polling cache immediately.
+        # If a DSL event just ended (or ping temporarily recovered), we keep the cached
+        # value for a short holdoff window so quick successive failures don't cause a burst
+        # of /status fetches.
+        now_mono = time.monotonic()
+        if _dsl_event_last_active_mono and (now_mono - _dsl_event_last_active_mono) < float(CONN_TYPE_CACHE_HOLDOFF_SECONDS):
+            return cast(ConnectionType, _conn_type_last_value)
+
         _conn_type_last_value = "unknown"
         _conn_type_last_fetch_mono = 0.0
         return "unknown"
@@ -327,11 +354,17 @@ def update_state(
     now_utc: datetime,
     http_timeout_trigger: bool = False,
 ) -> OutageState:
+    # Track "event active" across ticks using a monotonic timestamp so other parts (like
+    # Fritz polling cache) can apply holdoff logic safely.
+    if state.dsl_event_active:
+        mark_dsl_event_active_now()
+
     if http_timeout_trigger and not state.dsl_event_active:
         state.dsl_event_active = True
         state.dsl_event_start_utc = now_utc
         state.dsl_event_trigger = "http_timeout"
         state.dsl_event_end_reason = ""
+        mark_dsl_event_active_now()
 
     if ping_ok:
         state.consecutive_failures = 0
@@ -371,6 +404,7 @@ def update_state(
             state.dsl_event_start_utc = now_utc
             state.dsl_event_trigger = "ping_failures"
             state.dsl_event_end_reason = ""
+            mark_dsl_event_active_now()
 
         state.last_connection_type = get_connection_type_if_outage(True)
         if state.last_connection_type == "mobile":

@@ -17,7 +17,7 @@ Ein DSL-Event ist **der Zeitraum**, in dem wir aktiv Fritz-Synchron-/Verbindungs
 **Während DSL-Event:**
 - Fritz-Verbindungstyp wird **nur während eines Events** abgefragt und **max. 1× pro Minute** (rate-limited über `DSL_MONITOR_CONN_TYPE_POLL_INTERVAL_SECONDS`).
 - Wenn Fritz `connection_type == mobile`, wird die „mobile duration“ hochgezählt.
-- Die UI färbt Buckets **gelb**, wenn `mobile_duration_seconds >= DSL_MONITOR_MOBILE_YELLOW_THRESHOLD_SECONDS`.
+- Die UI färbt Buckets **rot**, wenn `dsl_event_active` gesetzt ist (Ping-Event: 3× Ping hintereinander ohne Antwort; ggf. auch HTTP-Timeout).
 
 **Event-Ende:**
 - Sobald Fritz wieder `connection_type == dsl` meldet → Ende (`dsl_event_end_reason=recovered_to_dsl`).
@@ -58,8 +58,20 @@ Danach:
 
 ```bash
 sudo journalctl -u dsl-monitor.service -f
+
+# Fritz TR-064 Bridge direkt (sollte am zuverlässigsten sein)
 curl -sS http://127.0.0.1:9077/status | jq
+
+# Web-Backend Proxy (das ist das, was die UI im Browser nutzt)
 curl -sS http://127.0.0.1:9076/api/fritz_status | jq
+
+# UI-Daten (Buckets + aktuelles dsl_event_active)
+curl -sS http://127.0.0.1:9076/api/data | jq
+
+# Manuelles Ad-hoc Check (Fritz + HTTP Probe)
+curl -sS -X POST http://127.0.0.1:9076/api/check_dsl_now | jq
+
+# HTTP Probe Status (live, cached)
 curl -sS http://127.0.0.1:9076/api/http_probe_status | jq
 ```
 

@@ -60,14 +60,14 @@ INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1>DSL Stability Monitor</h1>
-  <div class="subtitle">Last 7 days – ping probe every 10s, aggregated in 5‑minute buckets. Green = OK · Red = DSL outage event · Yellow = mobile > 5min.</div>
+  <h1>DSL Stability Monitor v.0.1</h1>
+  <div class="subtitle">Last 7 days  ping probe every 10s, aggregated in 5minute buckets. Green = Ping OK  Red = Ping event (3x no response).</div>
 
   <div style="margin-bottom: 0.75rem; font-size: 0.9rem; color: #ccc;">
     <span id="current-datetime"></span>
     <span style="margin-left: 1.5rem;">Last data update: <span id="last-updated"></span></span>
-    <span style="margin-left: 1.5rem;">Fritz status: <span id="fritz-status">—</span></span>
-    <span style="margin-left: 1.5rem;">HTTP probe: <span id="http-probe-status">—</span></span>
+    <span style="margin-left: 1.5rem;">Fritz status: <span id="fritz-status"></span></span>
+    <span style="margin-left: 1.5rem;">HTTP probe: <span id="http-probe-status"></span></span>
     <span style="margin-left: 1.5rem;">
       <button id="check-dsl" style="padding: 4px 10px; background:#1a202c; color:#eee; border:1px solid #333; border-radius:4px; cursor:pointer;">Check DSL now</button>
       <span id="check-dsl-result" style="margin-left: 0.75rem; color:#a0aec0;"></span>
@@ -76,6 +76,12 @@ INDEX_HTML = """<!doctype html>
 
   <div id="latency"></div>
   <div id="status"></div>
+
+  <div style="margin-top: 0.75rem; font-size: 0.9rem; color: #a0aec0;">
+    Fritz mapping:
+    <span style="display:inline-block; padding: 2px 8px; border-radius: 4px; background:#ecc94b; color:#111; margin-left: 0.5rem;">mobile</span>
+    <span style="display:inline-block; padding: 2px 8px; border-radius: 4px; background:#63b3ed; color:#111; margin-left: 0.5rem;">dsl</span>
+  </div>
 
   <h2 style="margin-top:2rem;">Outage Events (last 7 days)</h2>
   <table id="events-table">
@@ -120,10 +126,10 @@ INDEX_HTML = """<!doctype html>
     }
 
     async function loadFritzStatusIfNeeded(force=false) {
-      // Hard throttle: only poll Fritz while a DSL outage event is active, and then max 1/min.
+      // Hard throttle: only poll Fritz while a ping event is active, and then max 1/min.
       if (!outageActive) {
         lastFritzStatus = null;
-        setFritzUi('—', '#a0aec0');
+        setFritzUi('', '#a0aec0');
         return;
       }
 
@@ -136,7 +142,7 @@ INDEX_HTML = """<!doctype html>
       }
 
       lastFritzFetchMs = now;
-      setFritzUi('checking…', '#a0aec0');
+      setFritzUi('checking', '#a0aec0');
 
       try {
         const resp = await fetch('/api/fritz_status');
@@ -148,7 +154,7 @@ INDEX_HTML = """<!doctype html>
             color = '#ecc94b';
           } else if (data.connection_type === 'dsl') {
             text = 'dsl';
-            color = '#48bb78';
+            color = '#63b3ed';
           } else {
             text = 'unknown';
             color = '#a0aec0';
@@ -196,7 +202,7 @@ INDEX_HTML = """<!doctype html>
       const resp = await fetch('/api/data');
       const data = await resp.json();
 
-      // Determine whether a DSL event is currently active.
+      // Determine whether a ping event is currently active.
       // Prefer backend's raw-sample based flag.
       outageActive = !!data.dsl_event_active;
       if (!outageActive && data.points && data.points.length > 0) {
@@ -220,7 +226,6 @@ INDEX_HTML = """<!doctype html>
       const latencies = data.points.map(p => p.latency_ms);
       const colors = data.points.map(p => {
         if (p.status === 'outage') return '#f56565';
-        if (p.status === 'mobile') return '#ecc94b';
         return '#48bb78';
       });
 
@@ -230,7 +235,7 @@ INDEX_HTML = """<!doctype html>
         mode: 'lines+markers',
         marker: { color: colors, size: 6 },
         line: { color: '#63b3ed', width: 1 },
-        name: `Ping latency (ms) – ${data.bucket_minutes} min buckets`
+        name: `Ping latency (ms)  ${data.bucket_minutes} min buckets`
       };
 
       const latencyLayout = {
@@ -255,9 +260,8 @@ INDEX_HTML = """<!doctype html>
         },
         hoverinfo: 'x+text',
         text: data.points.map(p => {
-          if (p.status === 'outage') return `DSL OUTAGE in bucket (max ${formatDuration(p.max_outage_duration_seconds)})`;
+          if (p.status === 'outage') return `PING EVENT in bucket (max ${formatDuration(p.max_outage_duration_seconds)})`;
           const avg = p.latency_ms != null ? p.latency_ms.toFixed(1) : 'n/a';
-          if (p.status === 'mobile') return `MOBILE >5min (avg ${avg} ms, max mobile ${formatDuration(p.max_mobile_duration_seconds)})`;
           return `OK (avg ${avg} ms)`;
         })
       };
@@ -322,7 +326,7 @@ INDEX_HTML = """<!doctype html>
       if (!btn || !out) return;
 
       btn.disabled = true;
-      out.textContent = 'checking…';
+      out.textContent = 'checking';
       out.style.color = '#a0aec0';
 
       try {
@@ -332,7 +336,7 @@ INDEX_HTML = """<!doctype html>
         // Update status line components immediately
         if (data.fritz && data.fritz.ok) {
           let text, color;
-          if (data.fritz.connection_type === 'dsl') { text = 'dsl'; color = '#48bb78'; }
+          if (data.fritz.connection_type === 'dsl') { text = 'dsl'; color = '#63b3ed'; }
           else if (data.fritz.connection_type === 'mobile') { text = 'mobile'; color = '#ecc94b'; }
           else { text = 'unknown'; color = '#a0aec0'; }
           setFritzUi(text, color);
@@ -474,7 +478,6 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
                 "lat_sum": 0.0,
                 "lat_count": 0,
                 "has_outage": False,
-                "max_mobile_dur": 0.0,
             },
         )
 
@@ -485,19 +488,12 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         if p.get("dsl_event_active"):
             b["has_outage"] = True
 
-        if (p.get("connection_type") == "mobile") and p.get("mobile_duration_seconds") is not None:
-            b["max_mobile_dur"] = max(b["max_mobile_dur"], float(p["mobile_duration_seconds"]))
-
     agg_points: List[Dict[str, Any]] = []
     for ts in sorted(buckets.keys()):
         b = buckets[ts]
         lat = b["lat_sum"] / b["lat_count"] if b["lat_count"] > 0 else None
 
-        status = "ok"
-        if b["has_outage"]:
-            status = "outage"
-        elif b["max_mobile_dur"] >= MOBILE_YELLOW_THRESHOLD_SECONDS:
-            status = "mobile"
+        status = "outage" if b["has_outage"] else "ok"
 
         agg_points.append(
             {
@@ -505,7 +501,7 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
                 "latency_ms": lat,
                 "status": status,
                 "max_outage_duration_seconds": None,
-                "max_mobile_duration_seconds": b["max_mobile_dur"] if b["max_mobile_dur"] > 0 else None,
+                "max_mobile_duration_seconds": None,
             }
         )
 
