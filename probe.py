@@ -8,10 +8,9 @@ DSL event definition:
 - While active: poll Fritz connection_type at most once per minute.
 - Ends if pings recover AND Fritz reports connection_type == 'dsl', OR after 45 minutes.
 
-Probe writes a compact CSV that the web UI reads.
+Probe writes measurements to a SQLite database that the web UI reads.
 """
 
-import csv
 import os
 import platform
 import signal
@@ -20,26 +19,22 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Literal, Optional, Tuple, cast
 
 import requests
+
+from db import DB_PATH, DB_RETENTION_DAYS, ensure_schema, get_connection, insert_measurement, prune_old_rows
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 PING_TARGET = os.environ.get("DSL_MONITOR_PING_TARGET", "8.8.8.8")
 
-LOG_PATH = os.environ.get(
-    "DSL_MONITOR_LOG",
-    os.path.join(os.path.dirname(__file__), "dsl_log.csv"),
-)
+LOG_PATH = DB_PATH
 
 # Retention for the web UI display only.
 RETENTION_DAYS = int(os.environ.get("DSL_MONITOR_RETENTION_DAYS", "7"))
-
-# CSV pruning retention (0/empty = keep forever)
-CSV_RETENTION_DAYS = int(os.environ.get("DSL_MONITOR_CSV_RETENTION_DAYS", "0"))
 
 PING_INTERVAL_SECONDS = int(os.environ.get("DSL_MONITOR_PING_INTERVAL_SECONDS", "15"))
 CONSECUTIVE_FAILURES_THRESHOLD = int(os.environ.get("DSL_MONITOR_FAILURE_THRESHOLD", "3"))
@@ -149,81 +144,6 @@ def _http_probe_worker() -> None:
             except Exception as exc:  # noqa: BLE001
                 _http_probe_state.update(False, str(exc))
         time.sleep(0.5)
-
-
-# ---------------------------------------------------------------------------
-# CSV helpers
-# ---------------------------------------------------------------------------
-
-
-def ensure_log_header(path: str) -> None:
-    """Ensure CSV exists with the expected header.
-
-    No backwards compatibility: if an existing header differs, the file is re-initialized.
-    """
-
-    header = [
-        "timestamp",
-        "ping_target",
-        "ping_ok",
-        "latency_ms",
-        "consecutive_failures",
-        "dsl_event_active",
-        "dsl_event_trigger",
-        "dsl_event_duration_seconds",
-        "dsl_event_end_reason",
-        "connection_type",
-        "mobile_duration_seconds",
-        "http_probe_ok",
-        "http_probe_error",
-    ]
-
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
-        with open(path, "w", newline="") as f:
-            csv.writer(f).writerow(header)
-        return
-
-    try:
-        with open(path, "r", newline="") as f:
-            first = next(csv.reader(f), [])
-        if [c.strip() for c in first] != header:
-            with open(path, "w", newline="") as f:
-                csv.writer(f).writerow(header)
-    except Exception:
-        with open(path, "w", newline="") as f:
-            csv.writer(f).writerow(header)
-
-
-def append_and_prune_log(path: str, row: list) -> None:
-    ensure_log_header(path)
-    with open(path, "a", newline="") as f:
-        csv.writer(f).writerow(row)
-
-    # Keep all measurements by default. Enable pruning explicitly via env var.
-    if CSV_RETENTION_DAYS <= 0:
-        return
-
-    cutoff = datetime.now(timezone.utc) - timedelta(days=CSV_RETENTION_DAYS)
-
-    rows: list[list] = []
-    with open(path, "r", newline="") as f:
-        reader = csv.reader(f)
-        header = next(reader, None)
-        if header is None:
-            return
-        rows.append(header)
-        for r in reader:
-            try:
-                ts = datetime.fromisoformat(r[0])
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=timezone.utc)
-            except Exception:
-                continue
-            if ts >= cutoff:
-                rows.append(r)
-
-    with open(path, "w", newline="") as f:
-        csv.writer(f).writerows(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -491,9 +411,13 @@ def main() -> int:
         f"DSL Monitor probe starting. target={PING_TARGET} interval={PING_INTERVAL_SECONDS}s "
         f"threshold={CONSECUTIVE_FAILURES_THRESHOLD} timeout={PING_TIMEOUT_SECONDS}s "
         f"latency_threshold={PING_LATENCY_THRESHOLD_MS}ms "
-        f"fritz_normal={CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS}s fritz_event={CONN_TYPE_POLL_INTERVAL_SECONDS}s",
+        f"fritz_normal={CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS}s fritz_event={CONN_TYPE_POLL_INTERVAL_SECONDS}s "
+        f"db={LOG_PATH}",
         flush=True,
     )
+
+    db_conn = get_connection(LOG_PATH)
+    ensure_schema(db_conn)
 
     http_probe_thread = threading.Thread(target=_http_probe_worker, name="http-probe", daemon=True)
     http_probe_thread.start()
@@ -504,6 +428,7 @@ def main() -> int:
     )
 
     state = OutageState()
+    last_prune_mono = time.monotonic()
 
     while _running:
         tick_start = time.monotonic()
@@ -517,8 +442,6 @@ def main() -> int:
         )
 
         # Periodic Fritz check (rate-limited inside get_connection_type_if_outage).
-        # In normal mode this polls every 20min; during an event every 60s.
-        # If the normal-mode check discovers "mobile", that's a trigger.
         fritz_mobile_trigger = False
         if not state.dsl_event_active:
             ct_check = get_connection_type_if_outage(False)
@@ -535,28 +458,41 @@ def main() -> int:
         )
         _outage_dur, mobile_dur = compute_durations(state, now_utc)
 
-        # Always log connection_type (not just during events) so the status-box
-        # line can show dsl/mobile/unknown at all times.
         conn_type: ConnectionType = state.last_connection_type
         dsl_event_dur = _dsl_event_duration_seconds(state, now_utc)
 
-        row = [
-            now_utc.isoformat(),
-            PING_TARGET,
-            "1" if ping_ok else "0",
-            f"{latency_ms:.3f}" if ping_ok else "",
-            str(state.consecutive_failures),
-            "1" if state.dsl_event_active else "0",
-            state.dsl_event_trigger,
-            "" if dsl_event_dur is None else f"{dsl_event_dur:.1f}",
-            state.dsl_event_end_reason,
-            conn_type,
-            "" if mobile_dur is None else f"{mobile_dur:.1f}",
-            "" if http_ok is None else ("1" if http_ok else "0"),
-            http_err or "",
-        ]
+        # Only write trigger/end_reason when meaningful.
+        row_trigger: str = state.dsl_event_trigger if (state.dsl_event_active or state.dsl_event_end_reason) else ""
+        row_end_reason: str = state.dsl_event_end_reason
+        has_end_reason = bool(row_end_reason)
 
-        append_and_prune_log(LOG_PATH, row)
+        row = {
+            "timestamp": now_utc.isoformat(),
+            "ping_target": PING_TARGET,
+            "ping_ok": 1 if ping_ok else 0,
+            "latency_ms": round(latency_ms, 1) if ping_ok else None,
+            "consecutive_failures": state.consecutive_failures,
+            "dsl_event_active": 1 if state.dsl_event_active else 0,
+            "dsl_event_trigger": row_trigger,
+            "dsl_event_duration_seconds": round(dsl_event_dur, 1) if dsl_event_dur is not None else None,
+            "dsl_event_end_reason": row_end_reason,
+            "connection_type": conn_type,
+            "mobile_duration_seconds": round(mobile_dur, 1) if mobile_dur is not None else None,
+            "http_probe_ok": None if http_ok is None else (1 if http_ok else 0),
+            "http_probe_error": http_err or "",
+        }
+
+        insert_measurement(db_conn, row)
+
+        # Clear trigger + end_reason after writing.
+        if has_end_reason:
+            state.dsl_event_end_reason = ""
+            state.dsl_event_trigger = ""
+
+        # Prune old rows once per hour (not every tick).
+        if DB_RETENTION_DAYS > 0 and (tick_start - last_prune_mono) >= 3600:
+            prune_old_rows(db_conn, DB_RETENTION_DAYS)
+            last_prune_mono = tick_start
 
         elapsed = time.monotonic() - tick_start
         sleep_s = max(0.0, float(PING_INTERVAL_SECONDS) - elapsed)
@@ -564,6 +500,7 @@ def main() -> int:
         while _running and time.monotonic() < end:
             time.sleep(min(0.5, end - time.monotonic()))
 
+    db_conn.close()
     print("DSL Monitor probe stopped.", "signal=" + str(_last_signal) if _last_signal is not None else "", flush=True)
     return 0
 

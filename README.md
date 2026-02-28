@@ -4,7 +4,7 @@ Ein kleines DSL/Verbindungs-Monitoring.
 
 - `run.py` startet alles: Fritz-Status-Bridge (`fritz_status_service.py`), Probe (`probe.py`), Web UI (`web.py`).
 - Konfiguration über `.env` (niemals committen).
-- Logs werden als CSV geschrieben (`dsl_log.csv`).
+- Messdaten werden in einer SQLite-Datenbank gespeichert (`dsl_log.db`).
 
 ## UI / Plots
 
@@ -34,7 +34,7 @@ Ein DSL-Event ist **der Zeitraum**, in dem wir aktiv Fritz-Synchron-/Verbindungs
 - **Fritz meldet Mobile:** Auch im Normalbetrieb wird der Fritz-Status periodisch geprüft (alle `DSL_MONITOR_CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS`, Default: 1200s = 20min). Wenn dabei `connection_type == mobile` erkannt wird, startet **sofort** ein DSL-Event (`fritz_mobile`).
 
 **Fritz-Polling (Zwei Raten):**
-- **Normalbetrieb:** Fritz-Status alle 20min (`DSL_MONITOR_CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS`). Der Wert wird in der CSV/UI als `connection_type` geloggt (dsl/mobile/unknown). Erkennt proaktiv einen dsl→mobile-Wechsel.
+- **Normalbetrieb:** Fritz-Status alle 20min (`DSL_MONITOR_CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS`). Der Wert wird in der DB/UI als `connection_type` geloggt (dsl/mobile/unknown). Erkennt proaktiv einen dsl→mobile-Wechsel.
 - **Während DSL-Event:** Fritz-Status alle 60s (`DSL_MONITOR_CONN_TYPE_POLL_INTERVAL_SECONDS`). Damit sieht man schnell, wann die FritzBox von mobile zurück auf DSL wechselt.
 
 **Während DSL-Event:**
@@ -46,31 +46,33 @@ Ein DSL-Event ist **der Zeitraum**, in dem wir aktiv Fritz-Synchron-/Verbindungs
 - Oder nach `DSL_MONITOR_DSL_EVENT_MAX_SECONDS` (Default 45min) → Ende (`dsl_event_end_reason=max_duration`).
 - Nach Event-Ende: Fritz-Polling geht zurück auf 20min-Intervall.
 
-## Retention (Anzeige vs. CSV)
+## Retention (Anzeige vs. Datenbank)
 
-- `DSL_MONITOR_RETENTION_DAYS` wirkt **nur auf die Anzeige** in der Web-UI (Filter beim Lesen/Aggregieren).
-- Die CSV (`dsl_log.csv`) bleibt **standardmäßig vollständig** (alle Messwerte, kein automatisches Löschen).
+- `DSL_MONITOR_RETENTION_DAYS` wirkt **nur auf die Anzeige** in der Web-UI (SQL-Filter beim Lesen).
+- Die SQLite-DB (`dsl_log.db`) behält **standardmäßig alle Messwerte** (kein automatisches Löschen).
 - Optional kannst du explizites Pruning einschalten:
-  - `DSL_MONITOR_CSV_RETENTION_DAYS=<tage>`
-  - Default ist `0` (= unendlich / kein Pruning).
+  - `DSL_MONITOR_DB_RETENTION_DAYS=<tage>`
+  - Default ist `0` (= unendlich / kein Pruning). Pruning läuft max. 1×/Stunde.
 
-## CSV Schema (saubere Version)
+## SQLite Schema
 
-`dsl_log.csv` enthält exakt diese Spalten (keine Backward-Compat):
+`dsl_log.db` enthält die Tabelle `measurements` mit diesen Spalten:
 
-- `timestamp`: UTC ISO Zeitstempel
-- `ping_target`: Host/IP für den Primär-Ping
-- `ping_ok`: `1`/`0`
-- `latency_ms`: Ping-Latenz (nur bei ok)
-- `consecutive_failures`: Zähler der Ping-Fails
-- `dsl_event_active`: `1`/`0`
-- `dsl_event_trigger`: `ping_failures`, `http_timeout`, `high_latency` oder `fritz_mobile`
-- `dsl_event_duration_seconds`: Laufzeit des aktuellen Events
-- `dsl_event_end_reason`: `recovered_to_dsl` oder `max_duration` (leer während aktiv)
-- `connection_type`: `dsl`/`mobile`/`unknown` (wird immer geloggt, auch im Normalbetrieb)
-- `mobile_duration_seconds`: Dauer in `mobile` (während Event)
-- `http_probe_ok`: `1`/`0`/leer (noch nie geprüft)
-- `http_probe_error`: z.B. `timeout` oder `HTTP 500`
+| Spalte | Typ | Beschreibung |
+|---|---|---|
+| `timestamp` | TEXT | UTC ISO Zeitstempel |
+| `ping_target` | TEXT | Host/IP für den Primär-Ping |
+| `ping_ok` | INTEGER | `1`/`0` |
+| `latency_ms` | REAL | Ping-Latenz in ms (NULL bei Failure) |
+| `consecutive_failures` | INTEGER | Zähler der Ping-Fails |
+| `dsl_event_active` | INTEGER | `1`/`0` |
+| `dsl_event_trigger` | TEXT | `ping_failures`, `http_timeout`, `high_latency` oder `fritz_mobile` – nur während Event aktiv bzw. in der Abschlusszeile, danach leer. |
+| `dsl_event_duration_seconds` | REAL | Laufzeit des aktuellen Events (NULL wenn kein Event) |
+| `dsl_event_end_reason` | TEXT | `recovered_to_dsl` oder `max_duration` – nur in der Zeile, in der das Event endet. |
+| `connection_type` | TEXT | `dsl`/`mobile`/`unknown` (wird immer geloggt) |
+| `mobile_duration_seconds` | REAL | Dauer in `mobile` (NULL wenn nicht mobile) |
+| `http_probe_ok` | INTEGER | `1`/`0`/NULL (noch nie geprüft) |
+| `http_probe_error` | TEXT | z.B. `timeout` oder `HTTP 500` |
 
 ## Quickstart
 
@@ -116,4 +118,4 @@ Siehe `.env.example` (dort sind alle Keys inkl. Bedeutung dokumentiert). Wichtig
 - HTTP-Probe: `DSL_MONITOR_HTTP_PROBE_URL`, `DSL_MONITOR_HTTP_PROBE_INTERVAL_SECONDS`, `DSL_MONITOR_HTTP_PROBE_TIMEOUT_SECONDS`
 - Web: `DSL_MONITOR_WEB_HOST`, `DSL_MONITOR_WEB_PORT`
 - Orchestrator: `DSL_MONITOR_START_FRITZ_BRIDGE`
-- Optional CSV-Retention: `DSL_MONITOR_CSV_RETENTION_DAYS` (Default 0 = keep forever)
+- Optional DB-Retention: `DSL_MONITOR_DB_RETENTION_DAYS` (Default 0 = keep forever)

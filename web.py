@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import csv
 import json
 import os
 import threading
@@ -12,7 +11,9 @@ from typing import Any, Dict, List
 import requests
 from flask import Flask, jsonify, render_template_string
 
-LOG_PATH = os.environ.get("DSL_MONITOR_LOG", os.path.join(os.path.dirname(__file__), "dsl_log.csv"))
+from db import DB_PATH, ensure_schema, get_connection, query_measurements
+
+LOG_PATH = DB_PATH
 RETENTION_DAYS = int(os.environ.get("DSL_MONITOR_RETENTION_DAYS", "7"))
 
 BUCKET_MINUTES = int(os.environ.get("DSL_MONITOR_BUCKET_MINUTES", "5"))
@@ -60,7 +61,7 @@ INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1>DSL Stability Monitor v.0.2</h1>
+  <h1>DSL Stability Monitor v.0.4</h1>
   <div class="subtitle">Last 7 days   ping probe every 10s, aggregated in 5minute buckets. Ping: green=OK, red=event. Status boxes: red=outage, blue=dsl, yellow=mobile.</div>
 
   <div style="margin-bottom: 0.75rem; font-size: 0.9rem; color: #ccc;">
@@ -441,58 +442,34 @@ def _bucket_start(ts: datetime, minutes: int = 5) -> datetime:
     return out
 
 
-def _parse_bool01(value: str | None) -> bool:
-    return str(value or "").strip() == "1"
-
-
 def _load_raw_points() -> List[Dict[str, Any]]:
-    points: List[Dict[str, Any]] = []
-    if not os.path.exists(LOG_PATH):
-        return points
-
+    """Load measurement rows from SQLite, filtered to RETENTION_DAYS."""
     cutoff_utc = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
 
-    with open(LOG_PATH, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                ts_utc = datetime.fromisoformat(row["timestamp"])
-            except Exception:
-                continue
-            if ts_utc.tzinfo is None:
-                ts_utc = ts_utc.replace(tzinfo=timezone.utc)
-            if ts_utc < cutoff_utc:
-                continue
+    conn = get_connection(LOG_PATH)
+    ensure_schema(conn)
+    rows = query_measurements(conn, since_utc=cutoff_utc)
 
-            ping_ok = _parse_bool01(row.get("ping_ok"))
+    points: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            ts_utc = datetime.fromisoformat(row["timestamp"])
+        except Exception:
+            continue
+        if ts_utc.tzinfo is None:
+            ts_utc = ts_utc.replace(tzinfo=timezone.utc)
 
-            latency_ms: float | None
-            latency_str = (row.get("latency_ms") or "").strip()
-            try:
-                latency_ms = float(latency_str) if latency_str else None
-            except ValueError:
-                latency_ms = None
-
-            mobile_dur: float | None
-            mobile_dur_str = (row.get("mobile_duration_seconds") or "").strip()
-            try:
-                mobile_dur = float(mobile_dur_str) if mobile_dur_str else None
-            except ValueError:
-                mobile_dur = None
-
-            dsl_event_active = _parse_bool01(row.get("dsl_event_active"))
-
-            points.append(
-                {
-                    "timestamp_utc": ts_utc,
-                    "ping_ok": ping_ok,
-                    "latency_ms": latency_ms,
-                    "ping_target": row.get("ping_target", ""),
-                    "connection_type": (row.get("connection_type") or "unknown").lower(),
-                    "mobile_duration_seconds": mobile_dur,
-                    "dsl_event_active": dsl_event_active,
-                }
-            )
+        points.append(
+            {
+                "timestamp_utc": ts_utc,
+                "ping_ok": bool(row.get("ping_ok")),
+                "latency_ms": row.get("latency_ms"),
+                "ping_target": row.get("ping_target", ""),
+                "connection_type": (row.get("connection_type") or "unknown").lower(),
+                "mobile_duration_seconds": row.get("mobile_duration_seconds"),
+                "dsl_event_active": bool(row.get("dsl_event_active")),
+            }
+        )
 
     points.sort(key=lambda p: p["timestamp_utc"])
     return points

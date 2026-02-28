@@ -344,3 +344,33 @@ def test_event_mode_polls_fritz_every_60s(monkeypatch):
     assert calls["n"] == 2
 
 
+def test_trigger_and_end_reason_persist_in_state_after_event(monkeypatch):
+    """After an event ends, trigger/end_reason remain in OutageState (for the
+    CSV closing row).  The main loop is responsible for clearing them after
+    writing.  This test documents the state machine behaviour."""
+    monkeypatch.setattr("probe.get_connection_type_if_outage", lambda _: "dsl")
+    monkeypatch.setattr("probe.PING_LATENCY_THRESHOLD_MS", 100.0)
+
+    s = OutageState()
+
+    # High-latency starts event
+    s = update_state(s, ping_ok=True, now_utc=dt(0), latency_ms=158.0)
+    assert s.dsl_event_active
+    assert s.dsl_event_trigger == "high_latency"
+    assert s.dsl_event_end_reason == ""
+
+    # Normal latency + Fritz=dsl → event ends, end_reason set
+    s = update_state(s, ping_ok=True, now_utc=dt(10), latency_ms=15.0)
+    assert not s.dsl_event_active
+    assert s.dsl_event_trigger == "high_latency"
+    assert s.dsl_event_end_reason == "recovered_to_dsl"
+
+    # Simulate main-loop clearing (as the new code does after CSV write)
+    s.dsl_event_end_reason = ""
+    s.dsl_event_trigger = ""
+
+    # Subsequent ticks must have clean fields
+    s = update_state(s, ping_ok=True, now_utc=dt(20), latency_ms=15.0)
+    assert not s.dsl_event_active
+    assert s.dsl_event_trigger == ""
+    assert s.dsl_event_end_reason == ""
