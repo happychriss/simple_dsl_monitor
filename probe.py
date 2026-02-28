@@ -2,9 +2,11 @@
 """DSL Monitor – ping + HTTP probe + Fritz connection type.
 
 DSL event definition:
-- Starts if: (a) 3 consecutive ping failures OR (b) HTTP probe times out.
+- Starts if: (a) 3 consecutive ping failures, OR (b) HTTP probe times out,
+  OR (c) ping latency exceeds DSL_MONITOR_PING_LATENCY_THRESHOLD_MS (default 100ms,
+  indicating mobile-fallback routing).
 - While active: poll Fritz connection_type at most once per minute.
-- Ends if Fritz reports connection_type == 'dsl' OR after 45 minutes.
+- Ends if pings recover AND Fritz reports connection_type == 'dsl', OR after 45 minutes.
 
 Probe writes a compact CSV that the web UI reads.
 """
@@ -48,11 +50,9 @@ CONN_STATUS_URL = os.environ.get("DSL_CONN_STATUS_URL", "http://127.0.0.1:9077/s
 ConnectionType = Literal["dsl", "mobile", "unknown"]
 CONN_TYPE_POLL_INTERVAL_SECONDS = int(os.environ.get("DSL_MONITOR_CONN_TYPE_POLL_INTERVAL_SECONDS", "60"))
 
-# Holdoff window after a DSL event ends.
-# Rationale: ping can flap during recovery (short OK streaks). If we reset the Fritz poll cache
-# immediately on every ping_ok tick, the next failure would trigger an immediate /status fetch,
-# effectively hammering the Fritz status bridge. Keeping the cache for a short time avoids that.
-CONN_TYPE_CACHE_HOLDOFF_SECONDS = int(os.environ.get("DSL_MONITOR_CONN_TYPE_CACHE_HOLDOFF_SECONDS", "120"))
+# Normal-mode Fritz polling interval (seconds). Even when no event is active we
+# periodically check Fritz so we can detect a dsl→mobile switch proactively.
+CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS = int(os.environ.get("DSL_MONITOR_CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS", "1200"))  # 20min
 
 MOBILE_YELLOW_THRESHOLD_SECONDS = int(os.environ.get("DSL_MONITOR_MOBILE_YELLOW_THRESHOLD_SECONDS", "300"))
 
@@ -61,7 +61,11 @@ HTTP_PROBE_URL = os.environ.get("DSL_MONITOR_HTTP_PROBE_URL", "https://www.tages
 HTTP_PROBE_INTERVAL_SECONDS = int(os.environ.get("DSL_MONITOR_HTTP_PROBE_INTERVAL_SECONDS", "300"))
 HTTP_PROBE_TIMEOUT_SECONDS = float(os.environ.get("DSL_MONITOR_HTTP_PROBE_TIMEOUT_SECONDS", "15"))
 
-DslEventTrigger = Literal["", "ping_failures", "http_timeout"]
+# Latency threshold (ms): a ping that arrives but with latency above this value
+# is treated as a failure (e.g. mobile-fallback routing).  0 = disabled.
+PING_LATENCY_THRESHOLD_MS = float(os.environ.get("DSL_MONITOR_PING_LATENCY_THRESHOLD_MS", "100"))
+
+DslEventTrigger = Literal["", "ping_failures", "http_timeout", "high_latency", "fritz_mobile"]
 DslEventEndReason = Literal["", "recovered_to_dsl", "max_duration"]
 
 DSL_EVENT_MAX_SECONDS = int(os.environ.get("DSL_MONITOR_DSL_EVENT_MAX_SECONDS", "2700"))  # 45min
@@ -279,38 +283,31 @@ def get_fritz_status() -> dict:
 _conn_type_last_fetch_mono: float = 0.0
 _conn_type_last_value: ConnectionType = "unknown"
 
-# Timestamp (monotonic) of the last time we observed an active DSL event.
-_dsl_event_last_active_mono: float = 0.0
 
-
-def mark_dsl_event_active_now() -> None:
-    """Mark that a DSL event is currently active (monotonic timestamp).
-
-    This is used to avoid resetting the Fritz polling cache immediately when ping state flaps.
-    """
-
-    global _dsl_event_last_active_mono
-    _dsl_event_last_active_mono = time.monotonic()
+def _reset_fritz_poll_for_event() -> None:
+    """Reset the Fritz poll timer so the next call fetches immediately (60s rate)."""
+    global _conn_type_last_fetch_mono
+    _conn_type_last_fetch_mono = 0.0
 
 
 def get_connection_type_if_outage(in_outage: bool) -> ConnectionType:
+    """Fetch Fritz connection type with rate-limiting.
+
+    Two modes:
+    - Normal (in_outage=False): poll every CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS (20min).
+      This lets us detect dsl→mobile switches proactively.
+    - Event  (in_outage=True):  poll every CONN_TYPE_POLL_INTERVAL_SECONDS (60s).
+    """
     global _conn_type_last_fetch_mono, _conn_type_last_value
 
-    if not in_outage:
-        # Don't reset the Fritz polling cache immediately.
-        # If a DSL event just ended (or ping temporarily recovered), we keep the cached
-        # value for a short holdoff window so quick successive failures don't cause a burst
-        # of /status fetches.
-        now_mono = time.monotonic()
-        if _dsl_event_last_active_mono and (now_mono - _dsl_event_last_active_mono) < float(CONN_TYPE_CACHE_HOLDOFF_SECONDS):
-            return cast(ConnectionType, _conn_type_last_value)
-
-        _conn_type_last_value = "unknown"
-        _conn_type_last_fetch_mono = 0.0
-        return "unknown"
-
     now_mono = time.monotonic()
-    if (now_mono - _conn_type_last_fetch_mono) < CONN_TYPE_POLL_INTERVAL_SECONDS:
+
+    if in_outage:
+        interval = float(CONN_TYPE_POLL_INTERVAL_SECONDS)
+    else:
+        interval = float(CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS)
+
+    if (now_mono - _conn_type_last_fetch_mono) < interval:
         return cast(ConnectionType, _conn_type_last_value)
 
     _conn_type_last_fetch_mono = now_mono
@@ -362,19 +359,47 @@ def update_state(
     ping_ok: bool,
     now_utc: datetime,
     http_timeout_trigger: bool = False,
+    latency_ms: float = 0.0,
+    fritz_mobile_trigger: bool = False,
 ) -> OutageState:
-    # Track "event active" across ticks using a monotonic timestamp so other parts (like
-    # Fritz polling cache) can apply holdoff logic safely.
-    if state.dsl_event_active:
-        mark_dsl_event_active_now()
 
+    # --- fritz_mobile trigger (periodic 20min check found "mobile") ---
+    if fritz_mobile_trigger and not state.dsl_event_active:
+        state.dsl_event_active = True
+        state.dsl_event_start_utc = now_utc
+        state.dsl_event_trigger = "fritz_mobile"
+        state.dsl_event_end_reason = ""
+        state.last_connection_type = "mobile"
+        state.mobile_start_utc = now_utc
+        _reset_fritz_poll_for_event()
+
+    # --- http_timeout trigger ---
     if http_timeout_trigger and not state.dsl_event_active:
         state.dsl_event_active = True
         state.dsl_event_start_utc = now_utc
         state.dsl_event_trigger = "http_timeout"
         state.dsl_event_end_reason = ""
-        mark_dsl_event_active_now()
+        _reset_fritz_poll_for_event()
 
+    # --- High-latency detection ---
+    high_latency = bool(
+        ping_ok
+        and PING_LATENCY_THRESHOLD_MS > 0
+        and latency_ms > PING_LATENCY_THRESHOLD_MS
+    )
+    if high_latency:
+        ping_ok = False
+
+    if high_latency and not state.dsl_event_active:
+        state.dsl_event_active = True
+        state.dsl_event_start_utc = now_utc
+        state.dsl_event_trigger = "high_latency"
+        state.dsl_event_end_reason = ""
+        state.in_outage = True
+        state.outage_start_utc = now_utc
+        _reset_fritz_poll_for_event()
+
+    # --- ping_ok branch ---
     if ping_ok:
         state.consecutive_failures = 0
         if state.in_outage:
@@ -400,6 +425,7 @@ def update_state(
         state.last_connection_type = get_connection_type_if_outage(False)
         return state
 
+    # --- ping_fail branch ---
     state.consecutive_failures += 1
 
     started_outage = False
@@ -413,7 +439,7 @@ def update_state(
             state.dsl_event_start_utc = now_utc
             state.dsl_event_trigger = "ping_failures"
             state.dsl_event_end_reason = ""
-            mark_dsl_event_active_now()
+            _reset_fritz_poll_for_event()
 
         state.last_connection_type = get_connection_type_if_outage(True)
         if state.last_connection_type == "mobile":
@@ -434,11 +460,11 @@ def update_state(
         else:
             state.mobile_start_utc = None
 
-        if state.last_connection_type == "dsl":
-            state.dsl_event_active = False
-            state.dsl_event_end_reason = "recovered_to_dsl"
-            state.last_connection_type = get_connection_type_if_outage(False)
-            return state
+        # Do NOT end the DSL event while pings are still failing.
+        # Fritz may report "dsl" (DSL sync is up) even though internet
+        # routing is broken.  The event should only end when pings recover
+        # AND Fritz confirms "dsl" – that branch is handled above in the
+        # `if ping_ok:` section.
 
     return state
 
@@ -463,7 +489,9 @@ def compute_durations(state: OutageState, now_utc: datetime) -> tuple[Optional[f
 def main() -> int:
     print(
         f"DSL Monitor probe starting. target={PING_TARGET} interval={PING_INTERVAL_SECONDS}s "
-        f"threshold={CONSECUTIVE_FAILURES_THRESHOLD} timeout={PING_TIMEOUT_SECONDS}s",
+        f"threshold={CONSECUTIVE_FAILURES_THRESHOLD} timeout={PING_TIMEOUT_SECONDS}s "
+        f"latency_threshold={PING_LATENCY_THRESHOLD_MS}ms "
+        f"fritz_normal={CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS}s fritz_event={CONN_TYPE_POLL_INTERVAL_SECONDS}s",
         flush=True,
     )
 
@@ -488,10 +516,28 @@ def main() -> int:
             http_last_timeout_utc and (now_utc - http_last_timeout_utc).total_seconds() <= 60.0
         )
 
-        state = update_state(state, ping_ok=ping_ok, now_utc=now_utc, http_timeout_trigger=http_timeout_trigger)
+        # Periodic Fritz check (rate-limited inside get_connection_type_if_outage).
+        # In normal mode this polls every 20min; during an event every 60s.
+        # If the normal-mode check discovers "mobile", that's a trigger.
+        fritz_mobile_trigger = False
+        if not state.dsl_event_active:
+            ct_check = get_connection_type_if_outage(False)
+            if ct_check == "mobile":
+                fritz_mobile_trigger = True
+
+        state = update_state(
+            state,
+            ping_ok=ping_ok,
+            now_utc=now_utc,
+            http_timeout_trigger=http_timeout_trigger,
+            latency_ms=latency_ms,
+            fritz_mobile_trigger=fritz_mobile_trigger,
+        )
         _outage_dur, mobile_dur = compute_durations(state, now_utc)
 
-        conn_type: ConnectionType = state.last_connection_type if state.dsl_event_active else "unknown"
+        # Always log connection_type (not just during events) so the status-box
+        # line can show dsl/mobile/unknown at all times.
+        conn_type: ConnectionType = state.last_connection_type
         dsl_event_dur = _dsl_event_duration_seconds(state, now_utc)
 
         row = [
