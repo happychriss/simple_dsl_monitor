@@ -151,7 +151,7 @@ def _http_probe_worker() -> None:
 # ---------------------------------------------------------------------------
 
 
-def probe_ping(target: str, timeout: float = PING_TIMEOUT_SECONDS) -> Tuple[bool, float]:
+def probe_ping(target: str, timeout: float = PING_TIMEOUT_SECONDS) -> Tuple[bool, float, bool]:
     system = platform.system().lower()
     if system == "windows":
         cmd = ["ping", "-n", "1", "-w", str(int(timeout * 1000)), target]
@@ -173,14 +173,17 @@ def probe_ping(target: str, timeout: float = PING_TIMEOUT_SECONDS) -> Tuple[bool
                 if "time=" in line:
                     try:
                         time_str = line.split("time=")[1].split()[0]
-                        return True, float(time_str.replace("ms", ""))
+                        return True, float(time_str.replace("ms", "")), False
                     except Exception:
                         break
-            return True, 0.0
+            return True, 0.0, False
 
-        return False, 0.0
+        return False, 0.0, False
+    except subprocess.TimeoutExpired:
+        # If ping itself timed out, ensure we don't immediately fire the next ping.
+        return False, 0.0, True
     except Exception:
-        return False, 0.0
+        return False, 0.0, False
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +446,7 @@ def main() -> int:
         tick_start = time.monotonic()
         now_utc = _utc_now()
 
-        ping_ok, latency_ms = probe_ping(PING_TARGET, timeout=PING_TIMEOUT_SECONDS)
+        ping_ok, latency_ms, ping_timed_out = probe_ping(PING_TARGET, timeout=PING_TIMEOUT_SECONDS)
 
         http_ok, http_err, http_last_timeout_utc = _http_probe_state.snapshot()
         http_timeout_trigger = bool(
@@ -506,6 +509,9 @@ def main() -> int:
 
         elapsed = time.monotonic() - tick_start
         sleep_s = max(0.0, float(PING_INTERVAL_SECONDS) - elapsed)
+        if ping_timed_out:
+            # Additional cool-down after a timeout so timeouts don't happen back-to-back.
+            sleep_s += float(PING_TIMEOUT_SECONDS)
         end = time.monotonic() + sleep_s
         while _running and time.monotonic() < end:
             time.sleep(min(0.5, end - time.monotonic()))
