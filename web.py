@@ -303,6 +303,15 @@ INDEX_HTML = """<!doctype html>
         paper_bgcolor: '#111',
         plot_bgcolor: '#111',
         font: { color: '#eee' },
+        showlegend: true,
+        legend: {
+          orientation: 'h',
+          x: 0,
+          xanchor: 'left',
+          y: 1.25,
+          yanchor: 'bottom',
+          bgcolor: 'rgba(0,0,0,0)'
+        },
         xaxis: {
           title: 'Time',
           range: (xMin && xMax) ? [xMin, xMax] : undefined,
@@ -312,7 +321,8 @@ INDEX_HTML = """<!doctype html>
         },
         yaxis: { title: 'Ping latency (ms)', rangemode: 'tozero' },
         // Use identical margins across both plots so the plot AREA aligns.
-        margin: { t: 40, r: 10, b: 40, l: 60 }
+        // Reserve space at the top for the legend (above plot area).
+        margin: { t: 70, r: 10, b: 40, l: 60 }
       };
 
       const traces = [latencyTrace];
@@ -382,10 +392,19 @@ INDEX_HTML = """<!doctype html>
         },
         yaxis: { showgrid: false, zeroline: false, showticklabels: false, range: [0, 2], fixedrange: true },
         // Match margins with latency plot so x-axis and plot-area line up.
-        margin: { t: 20, r: 10, b: 40, l: 60 },
+        // Reserve space at the top for a legend that is ABOVE the plot area.
+        margin: { t: 60, r: 10, b: 40, l: 60 },
         height: 120,
-        // Legend changes plot-area width depending on font/viewport; disable for perfect alignment.
-        showlegend: false
+        showlegend: true,
+        // Keep legend ABOVE the plotting area so it never changes plot width.
+        legend: {
+          orientation: 'h',
+          x: 0,
+          xanchor: 'left',
+          y: 1.35,
+          yanchor: 'bottom',
+          bgcolor: 'rgba(0,0,0,0)'
+        }
       };
 
       // uirevision keeps plotly from reflowing axes in surprising ways between refreshes.
