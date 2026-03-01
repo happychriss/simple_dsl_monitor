@@ -245,6 +245,7 @@ INDEX_HTML = """<!doctype html>
       const times = data.points.map(p => new Date(p.timestamp));
       const latencies = data.points.map(p => p.latency_ms);
       const pingColors = data.points.map(p => {
+        // Main graph should be green by default, and red only when an event occurs in the bucket.
         if (p.status === 'outage') return '#f56565';
         return '#48bb78';
       });
@@ -280,7 +281,8 @@ INDEX_HTML = """<!doctype html>
         x: maxMarkerX,
         y: maxMarkerY,
         mode: 'markers',
-        marker: { color: '#f56565', size: 9, symbol: 'circle' },
+        // Outliers should be visible but not look like outages (use light green).
+        marker: { color: '#9ae6b4', size: 9, symbol: 'circle' },
         name: 'Max (triggered)'
       };
 
@@ -288,7 +290,7 @@ INDEX_HTML = """<!doctype html>
         x: p95MarkerX,
         y: p95MarkerY,
         mode: 'markers',
-        marker: { color: '#ed8936', size: 8, symbol: 'diamond' },
+        marker: { color: '#9ae6b4', size: 8, symbol: 'diamond' },
         name: 'P95 (triggered)'
       };
 
