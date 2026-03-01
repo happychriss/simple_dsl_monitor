@@ -244,6 +244,11 @@ INDEX_HTML = """<!doctype html>
 
       const times = data.points.map(p => new Date(p.timestamp));
       const latencies = data.points.map(p => p.latency_ms);
+
+      // Keep both charts perfectly aligned by using the exact same x-range.
+      // This avoids the "shift to the right" effect, especially on mobile.
+      const xMin = times.length ? times[0] : null;
+      const xMax = times.length ? times[times.length - 1] : null;
       const pingColors = data.points.map(p => {
         // Main graph should be green by default, and red only when an event occurs in the bucket.
         if (p.status === 'outage') return '#f56565';
@@ -298,7 +303,12 @@ INDEX_HTML = """<!doctype html>
         paper_bgcolor: '#111',
         plot_bgcolor: '#111',
         font: { color: '#eee' },
-        xaxis: { title: 'Time' },
+        xaxis: {
+          title: 'Time',
+          range: (xMin && xMax) ? [xMin, xMax] : undefined,
+          automargin: true,
+          ticklabeloverflow: 'hide past domain',
+        },
         yaxis: { title: 'Ping latency (ms)', rangemode: 'tozero' },
         margin: { t: 40, r: 10, b: 40, l: 50 }
       };
@@ -359,13 +369,24 @@ INDEX_HTML = """<!doctype html>
         paper_bgcolor: '#111',
         plot_bgcolor: '#111',
         font: { color: '#eee' },
-        xaxis: { showgrid: false, zeroline: false, showticklabels: true },
+        xaxis: {
+          showgrid: false,
+          zeroline: false,
+          showticklabels: true,
+          range: (xMin && xMax) ? [xMin, xMax] : undefined,
+          automargin: true,
+          ticklabeloverflow: 'hide past domain',
+        },
         yaxis: { showgrid: false, zeroline: false, showticklabels: false },
         margin: { t: 20, r: 10, b: 40, l: 40 },
         height: 120,
         showlegend: true,
         legend: { orientation: 'h', x: 0, y: 1.2 }
       };
+
+      // uirevision keeps plotly from reflowing axes in surprising ways between refreshes.
+      latencyLayout.uirevision = 'dsl-monitor';
+      statusLayout.uirevision = 'dsl-monitor';
 
       Plotly.newPlot('status', statusTraces, statusLayout, {responsive: true});
 
