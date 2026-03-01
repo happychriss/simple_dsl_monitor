@@ -24,6 +24,12 @@ PING_LATENCY_THRESHOLD_MS = float(os.environ.get("DSL_MONITOR_PING_LATENCY_THRES
 BUCKET_MINUTES = int(os.environ.get("DSL_MONITOR_BUCKET_MINUTES", "5"))
 MOBILE_YELLOW_THRESHOLD_SECONDS = int(os.environ.get("DSL_MONITOR_MOBILE_YELLOW_THRESHOLD_SECONDS", "300"))
 
+# Marker/"spike" detection in bucketed latency display
+# outside_fraction >= threshold => show extreme markers
+OUTSIDE_FRACTION_THRESHOLD = float(os.environ.get("DSL_MONITOR_OUTSIDE_FRACTION_THRESHOLD", "0.05"))
+# Also show a P95 dot when an extreme is triggered (1=true, 0=false)
+SHOW_P95_MARKER = os.environ.get("DSL_MONITOR_SHOW_P95_MARKER", "0") in {"1", "true", "True", "yes", "on"}
+
 # Fritz status fetch timeout (seconds). Older/slow TR-064 responses can take a bit.
 FRITZ_STATUS_TIMEOUT_SECONDS = float(os.environ.get("DSL_MONITOR_FRITZ_STATUS_TIMEOUT_SECONDS", "10"))
 
@@ -249,7 +255,41 @@ INDEX_HTML = """<!doctype html>
         mode: 'lines+markers',
         marker: { color: pingColors, size: 6 },
         line: { color: '#63b3ed', width: 1 },
-        name: `Ping latency (ms)  ${data.bucket_minutes} min buckets`
+        name: `Ping latency P50 (ms)  ${data.bucket_minutes} min buckets`
+      };
+
+      // Extreme markers: only for buckets where marker_triggered==true
+      const maxMarkerX = [];
+      const maxMarkerY = [];
+      const p95MarkerX = [];
+      const p95MarkerY = [];
+      for (const p of data.points) {
+        if (!p.marker_triggered) continue;
+        const t = new Date(p.timestamp);
+        if (p.latency_max != null) {
+          maxMarkerX.push(t);
+          maxMarkerY.push(p.latency_max);
+        }
+        if (p.latency_p95 != null) {
+          p95MarkerX.push(t);
+          p95MarkerY.push(p.latency_p95);
+        }
+      }
+
+      const maxMarkerTrace = {
+        x: maxMarkerX,
+        y: maxMarkerY,
+        mode: 'markers',
+        marker: { color: '#f56565', size: 9, symbol: 'circle' },
+        name: 'Max (triggered)'
+      };
+
+      const p95MarkerTrace = {
+        x: p95MarkerX,
+        y: p95MarkerY,
+        mode: 'markers',
+        marker: { color: '#ed8936', size: 8, symbol: 'diamond' },
+        name: 'P95 (triggered)'
       };
 
       const latencyLayout = {
@@ -261,7 +301,10 @@ INDEX_HTML = """<!doctype html>
         margin: { t: 40, r: 10, b: 40, l: 50 }
       };
 
-      Plotly.newPlot('latency', [latencyTrace], latencyLayout, {responsive: true});
+      const traces = [latencyTrace];
+      if (maxMarkerX.length > 0) traces.push(maxMarkerTrace);
+      if (p95MarkerX.length > 0) traces.push(p95MarkerTrace);
+      Plotly.newPlot('latency', traces, latencyLayout, {responsive: true});
 
       // --------------------------------------------------------------
       // Status boxes: red=outage, blue=dsl, yellow=mobile.
@@ -490,6 +533,29 @@ def _load_raw_points() -> List[Dict[str, Any]]:
 def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5) -> List[Dict[str, Any]]:
     buckets: dict[datetime, Dict[str, Any]] = {}
 
+    def _percentile(sorted_vals: list[float], p: float) -> float | None:
+        """Linear-interpolated percentile (inclusive endpoints).
+
+        p in [0, 1]. Returns None if no values.
+        """
+        if not sorted_vals:
+            return None
+        if p <= 0:
+            return float(sorted_vals[0])
+        if p >= 1:
+            return float(sorted_vals[-1])
+
+        n = len(sorted_vals)
+        if n == 1:
+            return float(sorted_vals[0])
+
+        # Similar to numpy.percentile with linear interpolation.
+        pos = p * (n - 1)
+        lo = int(pos)
+        hi = min(lo + 1, n - 1)
+        frac = pos - lo
+        return float(sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac)
+
     for p in raw_points:
         ts_utc: datetime = p["timestamp_utc"]
         bucket_ts = _bucket_start(ts_utc, minutes=bucket_minutes)
@@ -497,8 +563,8 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         b = buckets.setdefault(
             bucket_ts,
             {
-                # Display aggregation: use MAX latency within the bucket.
-                "lat_max": None,
+                # Keep raw successful ping latencies for percentile/marker logic.
+                "latencies": [],
                 "has_outage": False,
                 "has_mobile": False,
                 "has_dsl": False,
@@ -506,9 +572,7 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         )
 
         if p.get("latency_ms") is not None and p.get("ping_ok"):
-            v = float(p["latency_ms"])
-            if b["lat_max"] is None or v > float(b["lat_max"]):
-                b["lat_max"] = v
+            b["latencies"].append(float(p["latency_ms"]))
 
         if p.get("dsl_event_active"):
             b["has_outage"] = True
@@ -522,7 +586,30 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
     agg_points: List[Dict[str, Any]] = []
     for ts in sorted(buckets.keys()):
         b = buckets[ts]
-        lat = b["lat_max"]
+
+        lats = sorted([float(x) for x in b.get("latencies", [])])
+        p50 = _percentile(lats, 0.50)
+        p90 = _percentile(lats, 0.90)
+        p95 = _percentile(lats, 0.95)
+        lat_max = float(lats[-1]) if lats else None
+
+        # Bucket baseline line value (P50 / median)
+        lat = p50
+
+        # Spike threshold logic:
+        # U = m + max(0.2m, 3(P90-P50), 5ms)
+        # Trigger markers only if outside_fraction >= OUTSIDE_FRACTION_THRESHOLD
+        U = None
+        outside_fraction = 0.0
+        marker_triggered = False
+        if p50 is not None and p90 is not None and lats:
+            m = float(p50)
+            spread = float(p90) - float(p50)
+            bump = max(0.2 * m, 3.0 * spread, 5.0)
+            U = m + bump
+            outside_count = sum(1 for v in lats if v > U)
+            outside_fraction = outside_count / max(1, len(lats))
+            marker_triggered = outside_fraction >= OUTSIDE_FRACTION_THRESHOLD
 
         status = "outage" if b["has_outage"] else "ok"
 
@@ -539,6 +626,11 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
             {
                 "timestamp": ts.isoformat(),
                 "latency_ms": lat,
+                "latency_u": U,
+                "outside_fraction": outside_fraction,
+                "marker_triggered": marker_triggered,
+                "latency_max": lat_max if marker_triggered else None,
+                "latency_p95": (p95 if (marker_triggered and SHOW_P95_MARKER) else None),
                 "status": status,
                 "connection_type": bucket_ct,
                 "max_outage_duration_seconds": None,
