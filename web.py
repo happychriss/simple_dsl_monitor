@@ -16,6 +16,11 @@ from db import DB_PATH, ensure_schema, get_connection, query_measurements
 LOG_PATH = DB_PATH
 RETENTION_DAYS = int(os.environ.get("DSL_MONITOR_RETENTION_DAYS", "7"))
 
+# Keep these in sync with probe.py to display current settings in the UI.
+PING_INTERVAL_SECONDS = int(os.environ.get("DSL_MONITOR_PING_INTERVAL_SECONDS", "15"))
+FAILURE_THRESHOLD = int(os.environ.get("DSL_MONITOR_FAILURE_THRESHOLD", "3"))
+PING_LATENCY_THRESHOLD_MS = float(os.environ.get("DSL_MONITOR_PING_LATENCY_THRESHOLD_MS", "100"))
+
 BUCKET_MINUTES = int(os.environ.get("DSL_MONITOR_BUCKET_MINUTES", "5"))
 MOBILE_YELLOW_THRESHOLD_SECONDS = int(os.environ.get("DSL_MONITOR_MOBILE_YELLOW_THRESHOLD_SECONDS", "300"))
 
@@ -61,8 +66,8 @@ INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <h1>DSL Stability Monitor v.0.4</h1>
-  <div class="subtitle">Last 7 days   ping probe every 10s, aggregated in 5minute buckets. Ping: green=OK, red=event. Status boxes: red=outage, blue=dsl, yellow=mobile.</div>
+  <h1 id="page-title">DSL Stability Monitor</h1>
+  <div class="subtitle" id="page-subtitle"></div>
 
   <div style="margin-bottom: 0.75rem; font-size: 0.9rem; color: #ccc;">
     <span id="current-datetime"></span>
@@ -203,6 +208,13 @@ INDEX_HTML = """<!doctype html>
     async function loadData() {
       const resp = await fetch('/api/data');
       const data = await resp.json();
+
+      // Dynamic header/subtitle from backend config (no hardcoding).
+      const titleEl = document.getElementById('page-title');
+      if (titleEl && data.ui_title) titleEl.textContent = data.ui_title;
+
+      const subtitleEl = document.getElementById('page-subtitle');
+      if (subtitleEl && data.ui_subtitle) subtitleEl.textContent = data.ui_subtitle;
 
       // Determine whether a ping event is currently active.
       // Prefer backend's raw-sample based flag.
@@ -485,8 +497,8 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         b = buckets.setdefault(
             bucket_ts,
             {
-                "lat_sum": 0.0,
-                "lat_count": 0,
+                # Display aggregation: use MAX latency within the bucket.
+                "lat_max": None,
                 "has_outage": False,
                 "has_mobile": False,
                 "has_dsl": False,
@@ -494,8 +506,9 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         )
 
         if p.get("latency_ms") is not None and p.get("ping_ok"):
-            b["lat_sum"] += float(p["latency_ms"])
-            b["lat_count"] += 1
+            v = float(p["latency_ms"])
+            if b["lat_max"] is None or v > float(b["lat_max"]):
+                b["lat_max"] = v
 
         if p.get("dsl_event_active"):
             b["has_outage"] = True
@@ -509,7 +522,7 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
     agg_points: List[Dict[str, Any]] = []
     for ts in sorted(buckets.keys()):
         b = buckets[ts]
-        lat = b["lat_sum"] / b["lat_count"] if b["lat_count"] > 0 else None
+        lat = b["lat_max"]
 
         status = "outage" if b["has_outage"] else "ok"
 
@@ -588,12 +601,23 @@ def load_data() -> Dict[str, Any]:
         last_updated_utc = raw_points[-1]["timestamp_utc"].isoformat()
         dsl_event_active = bool(raw_points[-1].get("dsl_event_active"))
 
+    ui_title = "DSL Stability Monitor"
+    lat_thr = PING_LATENCY_THRESHOLD_MS
+    lat_thr_txt = "disabled" if lat_thr <= 0 else f"{int(lat_thr) if lat_thr.is_integer() else lat_thr}ms"
+    ui_subtitle = (
+        f"Last {RETENTION_DAYS} days · ping every {PING_INTERVAL_SECONDS}s · "
+        f"bucket size {BUCKET_MINUTES} min · latency threshold {lat_thr_txt} · "
+        f"failure threshold {FAILURE_THRESHOLD}"
+    )
+
     return {
         "points": agg_points,
         "events": events,
         "last_updated_utc": last_updated_utc,
         "bucket_minutes": BUCKET_MINUTES,
         "dsl_event_active": dsl_event_active,
+        "ui_title": ui_title,
+        "ui_subtitle": ui_subtitle,
     }
 
 

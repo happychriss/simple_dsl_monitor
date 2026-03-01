@@ -46,3 +46,30 @@ def test_bucket_ok_if_no_outage_even_when_mobile_present():
     buckets = _aggregate_buckets(pts, bucket_minutes=5)
     assert len(buckets) == 1
     assert buckets[0]["status"] == "ok"
+
+
+def test_bucket_latency_is_max_of_successful_pings_in_bucket():
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+    pts = [
+        {
+            "timestamp_utc": base.replace(second=5),
+            "ping_ok": True,
+            "dsl_event_active": False,
+            "latency_ms": 10.0,
+            "connection_type": "dsl",
+            "mobile_duration_seconds": None,
+        },
+        {
+            "timestamp_utc": base.replace(minute=4, second=55),
+            "ping_ok": True,
+            "dsl_event_active": False,
+            "latency_ms": 30.0,
+            "connection_type": "dsl",
+            "mobile_duration_seconds": None,
+        },
+    ]
+
+    buckets = _aggregate_buckets(pts, bucket_minutes=5)
+    assert len(buckets) == 1
+    assert buckets[0]["latency_ms"] == 30.0
+

@@ -267,6 +267,15 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _local_now() -> datetime:
+    """Return a tz-aware local timestamp.
+
+    Stored in the DB so the raw value matches what the UI displays.
+    (Still unambiguous because it includes the local UTC offset.)
+    """
+    return datetime.now().astimezone()
+
+
 def _dsl_event_duration_seconds(state: OutageState, now_utc: datetime) -> Optional[float]:
     if not state.dsl_event_active or state.dsl_event_start_utc is None:
         return None
@@ -467,7 +476,8 @@ def main() -> int:
         has_end_reason = bool(row_end_reason)
 
         row = {
-            "timestamp": now_utc.isoformat(),
+            # Store local time (tz-aware) so DB timestamps match UI local display.
+            "timestamp": _local_now().isoformat(),
             "ping_target": PING_TARGET,
             "ping_ok": 1 if ping_ok else 0,
             "latency_ms": round(latency_ms, 1) if ping_ok else None,

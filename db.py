@@ -84,8 +84,13 @@ def prune_old_rows(conn: sqlite3.Connection, retention_days: int) -> int:
     """Delete rows older than *retention_days*.  Returns deleted count."""
     if retention_days <= 0:
         return 0
+    # Timestamps are stored as ISO8601 strings (tz-aware). To be robust across
+    # offsets (local time vs UTC), compare via SQLite's julianday() conversion.
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
-    cur = conn.execute("DELETE FROM measurements WHERE timestamp < ?", (cutoff,))
+    cur = conn.execute(
+        "DELETE FROM measurements WHERE julianday(timestamp) < julianday(?)",
+        (cutoff,),
+    )
     conn.commit()
     return cur.rowcount
 
@@ -97,12 +102,12 @@ def query_measurements(
     """Return measurements as a list of plain dicts, ordered by timestamp."""
     if since_utc is not None:
         rows = conn.execute(
-            "SELECT * FROM measurements WHERE timestamp >= ? ORDER BY timestamp",
+            "SELECT * FROM measurements WHERE julianday(timestamp) >= julianday(?) ORDER BY julianday(timestamp)",
             (since_utc.isoformat(),),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM measurements ORDER BY timestamp"
+            "SELECT * FROM measurements ORDER BY julianday(timestamp)"
         ).fetchall()
     return [dict(r) for r in rows]
 

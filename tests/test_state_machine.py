@@ -22,6 +22,18 @@ def test_outage_starts_after_three_failures(monkeypatch):
     assert s.dsl_event_trigger == "ping_failures"
 
 
+def test_failure_threshold_1_triggers_on_first_failed_ping(monkeypatch):
+    """DSL_MONITOR_FAILURE_THRESHOLD=1 must start an event on the first failed ping."""
+    monkeypatch.setattr("probe.get_connection_type_if_outage", lambda in_outage: "unknown")
+    monkeypatch.setattr(probe, "CONSECUTIVE_FAILURES_THRESHOLD", 1)
+
+    s = OutageState()
+    s = update_state(s, ping_ok=False, now_utc=dt(0), http_timeout_trigger=False)
+    assert s.dsl_event_active
+    assert s.dsl_event_start_utc == dt(0)
+    assert s.dsl_event_trigger == "ping_failures"
+
+
 def test_outage_ends_on_first_success(monkeypatch):
     # End condition depends on Fritz reporting 'dsl'.
     # So we simulate: during event -> 'mobile', then on recovery tick -> 'dsl'.
