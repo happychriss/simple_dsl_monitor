@@ -306,11 +306,13 @@ INDEX_HTML = """<!doctype html>
         xaxis: {
           title: 'Time',
           range: (xMin && xMax) ? [xMin, xMax] : undefined,
+          domain: [0, 1],
           automargin: true,
           ticklabeloverflow: 'hide past domain',
         },
         yaxis: { title: 'Ping latency (ms)', rangemode: 'tozero' },
-        margin: { t: 40, r: 10, b: 40, l: 50 }
+        // Use identical margins across both plots so the plot AREA aligns.
+        margin: { t: 40, r: 10, b: 40, l: 60 }
       };
 
       const traces = [latencyTrace];
@@ -374,21 +376,23 @@ INDEX_HTML = """<!doctype html>
           zeroline: false,
           showticklabels: true,
           range: (xMin && xMax) ? [xMin, xMax] : undefined,
+          domain: [0, 1],
           automargin: true,
           ticklabeloverflow: 'hide past domain',
         },
-        yaxis: { showgrid: false, zeroline: false, showticklabels: false },
-        margin: { t: 20, r: 10, b: 40, l: 40 },
+        yaxis: { showgrid: false, zeroline: false, showticklabels: false, range: [0, 2], fixedrange: true },
+        // Match margins with latency plot so x-axis and plot-area line up.
+        margin: { t: 20, r: 10, b: 40, l: 60 },
         height: 120,
-        showlegend: true,
-        legend: { orientation: 'h', x: 0, y: 1.2 }
+        // Legend changes plot-area width depending on font/viewport; disable for perfect alignment.
+        showlegend: false
       };
 
       // uirevision keeps plotly from reflowing axes in surprising ways between refreshes.
       latencyLayout.uirevision = 'dsl-monitor';
       statusLayout.uirevision = 'dsl-monitor';
 
-      Plotly.newPlot('status', statusTraces, statusLayout, {responsive: true});
+      Plotly.newPlot('status', statusTraces, statusLayout, {responsive: true, displayModeBar: false});
 
       const tbody = document.querySelector('#events-table tbody');
       tbody.innerHTML = '';
