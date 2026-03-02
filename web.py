@@ -16,6 +16,10 @@ from db import DB_PATH, ensure_schema, get_connection, query_measurements
 LOG_PATH = DB_PATH
 RETENTION_DAYS = int(os.environ.get("DSL_MONITOR_RETENTION_DAYS", "7"))
 
+# Optional: read display data from a remote datasette instance instead of local SQLite.
+# Set to e.g. http://zo:8001/dsl_log/measurements.json to enable.
+DATASETTE_URL = os.environ.get("DSL_MONITOR_DATASETTE_URL", "")
+
 # Keep these in sync with probe.py to display current settings in the UI.
 PING_INTERVAL_SECONDS = int(os.environ.get("DSL_MONITOR_PING_INTERVAL_SECONDS", "15"))
 FAILURE_THRESHOLD = int(os.environ.get("DSL_MONITOR_FAILURE_THRESHOLD", "3"))
@@ -62,7 +66,6 @@ INDEX_HTML = """<!doctype html>
     h1 { margin-bottom: 0.2rem; }
     .subtitle { color: #aaa; margin-bottom: 1.5rem; }
     #latency { width: 100%; height: 400px; }
-    #status { width: 100%; height: 120px; margin-top: 30px; }
     table { width: 100%; border-collapse: collapse; margin-top: 30px; font-size: 0.9rem; }
     th, td { padding: 6px 8px; border-bottom: 1px solid #333; text-align: left; }
     th { background: #1a202c; }
@@ -87,14 +90,6 @@ INDEX_HTML = """<!doctype html>
   </div>
 
   <div id="latency"></div>
-  <div id="status"></div>
-
-  <div style="margin-top: 0.75rem; font-size: 0.9rem; color: #a0aec0;">
-    Fritz mapping:
-    <span style="display:inline-block; padding: 2px 8px; border-radius: 4px; background:#ecc94b; color:#111; margin-left: 0.5rem;">mobile</span>
-    <span style="display:inline-block; padding: 2px 8px; border-radius: 4px; background:#63b3ed; color:#111; margin-left: 0.5rem;">dsl</span>
-    <span style="display:inline-block; padding: 2px 8px; border-radius: 4px; background:#f56565; color:#111; margin-left: 0.5rem;">outage</span>
-  </div>
 
   <h2 style="margin-top:2rem;">Outage Events (last 7 days)</h2>
   <table id="events-table">
@@ -250,8 +245,7 @@ INDEX_HTML = """<!doctype html>
       const xMin = times.length ? times[0] : null;
       const xMax = times.length ? times[times.length - 1] : null;
       const pingColors = data.points.map(p => {
-        // Main graph should be green by default, and red only when an event occurs in the bucket.
-        if (p.status === 'outage') return '#f56565';
+        if (p.status === 'outage') return '#ecc94b';
         return '#48bb78';
       });
 
@@ -264,21 +258,28 @@ INDEX_HTML = """<!doctype html>
         name: `Ping latency P50 (ms)  ${data.bucket_minutes} min buckets`
       };
 
-      // Extreme markers: only for buckets where marker_triggered==true
+      // Extreme markers: only for buckets where marker_triggered==true, capped at 300ms
+      const PEAK_CAP_MS = 300;
       const maxMarkerX = [];
       const maxMarkerY = [];
+      const maxMarkerSizes = [];
       const p95MarkerX = [];
       const p95MarkerY = [];
+      const p95MarkerSizes = [];
       for (const p of data.points) {
         if (!p.marker_triggered) continue;
         const t = new Date(p.timestamp);
         if (p.latency_max != null) {
+          const capped = p.latency_max > PEAK_CAP_MS;
           maxMarkerX.push(t);
-          maxMarkerY.push(p.latency_max);
+          maxMarkerY.push(capped ? PEAK_CAP_MS : p.latency_max);
+          maxMarkerSizes.push(capped ? 5 : 3);
         }
         if (p.latency_p95 != null) {
+          const capped = p.latency_p95 > PEAK_CAP_MS;
           p95MarkerX.push(t);
-          p95MarkerY.push(p.latency_p95);
+          p95MarkerY.push(capped ? PEAK_CAP_MS : p.latency_p95);
+          p95MarkerSizes.push(capped ? 5 : 3);
         }
       }
 
@@ -286,8 +287,7 @@ INDEX_HTML = """<!doctype html>
         x: maxMarkerX,
         y: maxMarkerY,
         mode: 'markers',
-        // Outliers should be visible but not look like outages (use light green).
-        marker: { color: '#9ae6b4', size: 9, symbol: 'circle' },
+        marker: { color: '#444', size: maxMarkerSizes, symbol: 'circle' },
         name: 'Max (triggered)'
       };
 
@@ -295,7 +295,7 @@ INDEX_HTML = """<!doctype html>
         x: p95MarkerX,
         y: p95MarkerY,
         mode: 'markers',
-        marker: { color: '#9ae6b4', size: 8, symbol: 'diamond' },
+        marker: { color: '#444', size: p95MarkerSizes, symbol: 'diamond' },
         name: 'P95 (triggered)'
       };
 
@@ -319,7 +319,7 @@ INDEX_HTML = """<!doctype html>
           automargin: true,
           ticklabeloverflow: 'hide past domain',
         },
-        yaxis: { title: 'Ping latency (ms)', rangemode: 'tozero' },
+        yaxis: { title: 'Ping latency (ms)', type: 'log' },
         // Use identical margins across both plots so the plot AREA aligns.
         // Reserve space at the top for the legend (above plot area).
         margin: { t: 70, r: 10, b: 40, l: 60 }
@@ -330,88 +330,8 @@ INDEX_HTML = """<!doctype html>
       if (p95MarkerX.length > 0) traces.push(p95MarkerTrace);
       Plotly.newPlot('latency', traces, latencyLayout, {responsive: true});
 
-      // --------------------------------------------------------------
-      // Status boxes: red=outage, blue=dsl, yellow=mobile.
-      // If there's no outage in a bucket, we default to DSL.
-      // --------------------------------------------------------------
-      const statusType = (p) => {
-        if (p.status === 'outage') return 'outage';
-        // backend sends connection_type (dsl/mobile/unknown). Unknown defaults to DSL.
-        const ct = (p.connection_type || 'unknown').toLowerCase();
-        if (ct === 'mobile') return 'mobile';
-        return 'dsl';
-      };
-
-      const statusText = (p) => {
-        const avg = p.latency_ms != null ? p.latency_ms.toFixed(1) : 'n/a';
-        const t = statusType(p);
-        if (t === 'outage') return `OUTAGE (ping event)`;
-        if (t === 'mobile') return `MOBILE (avg ${avg} ms)`;
-        return `DSL (avg ${avg} ms)`;
-      };
-
-      const mkTrace = (label, color, predicate) => {
-        const x = [];
-        const y = [];
-        const text = [];
-        data.points.forEach((p) => {
-          if (!predicate(p)) return;
-          x.push(new Date(p.timestamp));
-          y.push(1);
-          text.push(statusText(p));
-        });
-        return {
-          x,
-          y,
-          mode: 'markers',
-          name: label,
-          marker: { color, size: 10, symbol: 'square' },
-          hoverinfo: 'x+text',
-          text,
-        };
-      };
-
-      const statusTraces = [
-        mkTrace('outage', '#f56565', (p) => statusType(p) === 'outage'),
-        mkTrace('dsl', '#63b3ed', (p) => statusType(p) === 'dsl'),
-        mkTrace('mobile', '#ecc94b', (p) => statusType(p) === 'mobile'),
-      ];
-
-      const statusLayout = {
-        paper_bgcolor: '#111',
-        plot_bgcolor: '#111',
-        font: { color: '#eee' },
-        xaxis: {
-          showgrid: false,
-          zeroline: false,
-          showticklabels: true,
-          range: (xMin && xMax) ? [xMin, xMax] : undefined,
-          domain: [0, 1],
-          automargin: true,
-          ticklabeloverflow: 'hide past domain',
-        },
-        yaxis: { showgrid: false, zeroline: false, showticklabels: false, range: [0, 2], fixedrange: true },
-        // Match margins with latency plot so x-axis and plot-area line up.
-        // Reserve space at the top for a legend that is ABOVE the plot area.
-        margin: { t: 60, r: 10, b: 40, l: 60 },
-        height: 120,
-        showlegend: true,
-        // Keep legend ABOVE the plotting area so it never changes plot width.
-        legend: {
-          orientation: 'h',
-          x: 0,
-          xanchor: 'left',
-          y: 1.35,
-          yanchor: 'bottom',
-          bgcolor: 'rgba(0,0,0,0)'
-        }
-      };
-
       // uirevision keeps plotly from reflowing axes in surprising ways between refreshes.
       latencyLayout.uirevision = 'dsl-monitor';
-      statusLayout.uirevision = 'dsl-monitor';
-
-      Plotly.newPlot('status', statusTraces, statusLayout, {responsive: true, displayModeBar: false});
 
       const tbody = document.querySelector('#events-table tbody');
       tbody.innerHTML = '';
@@ -543,13 +463,42 @@ def _bucket_start(ts: datetime, minutes: int = 5) -> datetime:
     return out
 
 
+def _fetch_datasette_rows(since_utc: datetime) -> List[Dict[str, Any]]:
+    """Fetch measurement rows from a datasette JSON endpoint with pagination."""
+    all_rows: List[Dict[str, Any]] = []
+    # First request: apply retention filter and request object-shaped rows
+    next_url: str | None = None
+    resp = requests.get(
+        DATASETTE_URL,
+        params={"_shape": "objects", "_size": 1000, "timestamp__gte": since_utc.isoformat()},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    page = resp.json()
+    all_rows.extend(page.get("rows", []))
+    next_url = page.get("next_url")
+
+    # Follow pagination links until exhausted
+    while next_url:
+        resp = requests.get(next_url, timeout=15)
+        resp.raise_for_status()
+        page = resp.json()
+        all_rows.extend(page.get("rows", []))
+        next_url = page.get("next_url")
+
+    return all_rows
+
+
 def _load_raw_points() -> List[Dict[str, Any]]:
-    """Load measurement rows from SQLite, filtered to RETENTION_DAYS."""
+    """Load measurement rows from datasette (if configured) or local SQLite, filtered to RETENTION_DAYS."""
     cutoff_utc = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
 
-    conn = get_connection(LOG_PATH)
-    ensure_schema(conn)
-    rows = query_measurements(conn, since_utc=cutoff_utc)
+    if DATASETTE_URL:
+        rows = _fetch_datasette_rows(cutoff_utc)
+    else:
+        conn = get_connection(LOG_PATH)
+        ensure_schema(conn)
+        rows = query_measurements(conn, since_utc=cutoff_utc)
 
     points: List[Dict[str, Any]] = []
     for row in rows:
