@@ -453,6 +453,16 @@ def main() -> int:
             http_last_timeout_utc and (now_utc - http_last_timeout_utc).total_seconds() <= 60.0
         )
 
+        # On ping recovery (had ≥1 failure, now ok): force an immediate Fritz check
+        # this tick, regardless of the normal poll interval.  This catches the case
+        # where the router briefly switched to mobile during the gap – we want to
+        # record that even if the outage was too short to reach the failure threshold.
+        # After this one forced fetch the timer is set normally, so regular
+        # rate-limiting resumes automatically.
+        recovering = ping_ok and state.consecutive_failures > 0
+        if recovering:
+            _reset_fritz_poll_for_event()
+
         # Periodic Fritz check (rate-limited inside get_connection_type_if_outage).
         fritz_mobile_trigger = False
         if not state.dsl_event_active:

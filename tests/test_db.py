@@ -122,6 +122,36 @@ class TestWebReadsDb:
         assert len(buckets) >= 1
         assert buckets[0]["status"] == "ok"
 
+    def test_load_raw_points_reads_local_sqlite(self, tmp_path, monkeypatch):
+        db_file = str(tmp_path / "test.db")
+        conn = get_connection(db_file)
+        ensure_schema(conn)
+
+        ts = datetime.now(timezone.utc) - timedelta(minutes=5)
+        insert_measurement(conn, _make_row(ts, latency_ms=12.3))
+        conn.close()
+
+        monkeypatch.setattr("web.LOG_PATH", db_file)
+
+        points = _load_raw_points()
+        assert len(points) == 1
+        assert points[0]["latency_ms"] == 12.3
+
+    def test_load_raw_points_reads_dsl_event_trigger(self, tmp_path, monkeypatch):
+        db_file = str(tmp_path / "test.db")
+        conn = get_connection(db_file)
+        ensure_schema(conn)
+
+        ts = datetime.now(timezone.utc) - timedelta(minutes=5)
+        insert_measurement(conn, _make_row(ts, ping_ok=False, dsl_event_active=True, dsl_event_trigger="http_timeout"))
+        conn.close()
+
+        monkeypatch.setattr("web.LOG_PATH", db_file)
+
+        points = _load_raw_points()
+        assert len(points) == 1
+        assert points[0]["dsl_event_trigger"] == "http_timeout"
+
     def test_outage_bucket(self, tmp_path, monkeypatch):
         db_file = str(tmp_path / "test.db")
         conn = get_connection(db_file)
@@ -149,4 +179,5 @@ class TestWebReadsDb:
         # At least one bucket should be outage
         statuses = {b["status"] for b in buckets}
         assert "outage" in statuses
+
 

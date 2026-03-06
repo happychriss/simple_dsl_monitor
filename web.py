@@ -16,10 +16,6 @@ from db import DB_PATH, ensure_schema, get_connection, query_measurements
 LOG_PATH = DB_PATH
 RETENTION_DAYS = int(os.environ.get("DSL_MONITOR_RETENTION_DAYS", "7"))
 
-# Optional: read display data from a remote datasette instance instead of local SQLite.
-# Set to e.g. http://zo:8001/dsl_log/measurements.json to enable.
-DATASETTE_URL = os.environ.get("DSL_MONITOR_DATASETTE_URL", "")
-
 # Keep these in sync with probe.py to display current settings in the UI.
 PING_INTERVAL_SECONDS = int(os.environ.get("DSL_MONITOR_PING_INTERVAL_SECONDS", "15"))
 FAILURE_THRESHOLD = int(os.environ.get("DSL_MONITOR_FAILURE_THRESHOLD", "3"))
@@ -65,13 +61,21 @@ INDEX_HTML = """<!doctype html>
     body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 20px; background: #111; color: #eee; }
     h1 { margin-bottom: 0.2rem; }
     .subtitle { color: #aaa; margin-bottom: 1.5rem; }
-    #latency { width: 100%; height: 400px; }
-    table { width: 100%; border-collapse: collapse; margin-top: 30px; font-size: 0.9rem; }
+    .layout { display: flex; flex-direction: column; gap: 24px; }
+    .chart-panel { width: 100%; min-width: 0; }
+    .table-panel { width: 100%; min-width: 0; }
+    #latency { width: 100%; height: 70vh; min-height: 400px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.9rem; }
     th, td { padding: 6px 8px; border-bottom: 1px solid #333; text-align: left; }
     th { background: #1a202c; }
     tr:nth-child(even) { background: #1a1a1a; }
     .outage { color: #f56565; font-weight: 500; }
+    .warning { color: #ecc94b; font-weight: 500; }
     a { color: #4fd1c5; }
+    @media (max-width: 1000px) {
+      .chart-panel, .table-panel { width: 100%; }
+      #latency { height: 50vh; }
+    }
   </style>
 </head>
 <body>
@@ -84,30 +88,49 @@ INDEX_HTML = """<!doctype html>
     <span style="margin-left: 1.5rem;">Fritz status: <span id="fritz-status"></span></span>
     <span style="margin-left: 1.5rem;">HTTP probe: <span id="http-probe-status"></span></span>
     <span style="margin-left: 1.5rem;">
+      <label for="auto-refresh-toggle" style="display:inline-flex; align-items:center; gap:0.35rem; color:#ccc; cursor:pointer;">
+        <input id="auto-refresh-toggle" type="checkbox" checked>
+        <span id="auto-refresh-label">Refresh on</span>
+      </label>
+    </span>
+    <span style="margin-left: 1.5rem;">
       <button id="check-dsl" style="padding: 4px 10px; background:#1a202c; color:#eee; border:1px solid #333; border-radius:4px; cursor:pointer;">Check DSL now</button>
       <span id="check-dsl-result" style="margin-left: 0.75rem; color:#a0aec0;"></span>
     </span>
   </div>
 
-  <div id="latency"></div>
+  <div class="layout">
+    <section class="chart-panel">
+      <div id="latency"></div>
+    </section>
 
-  <h2 style="margin-top:2rem;">Outage Events (last 7 days)</h2>
-  <table id="events-table">
-    <thead>
-      <tr>
-        <th>#</th>
-        <th>Start (local)</th>
-        <th>End (local)</th>
-        <th>Duration</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
+    <section class="table-panel">
+      <h2 style="margin-top:0;">Outage Events (last 7 days)</h2>
+      <table id="events-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Start (local)</th>
+            <th>Duration</th>
+            <th>Trig</th>
+            <th>Mobile</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </div>
 
   <script>
     let lastFritzStatus = null;
     let lastFritzFetchMs = 0;
     let outageActive = false;
+    let latencyChartInitialized = false;
+    const AUTO_REFRESH_STORAGE_KEY = 'dsl-monitor-auto-refresh-enabled';
+    let autoRefreshEnabled = true;
+    let autoRefreshIntervalId = null;
+    // Explicitly tracked user zoom range (null = show full range / autorange).
+    let userZoomRange = null;
 
     function formatDuration(seconds) {
       if (seconds == null) return '';
@@ -117,6 +140,16 @@ INDEX_HTML = """<!doctype html>
       if (mins === 0) return `${rem}s`;
       if (rem === 0) return `${mins} min`;
       return `${mins}m ${rem}s`;
+    }
+
+    function formatTrigger(trigger) {
+      const labels = {
+        ping_failures: 'Ping',
+        high_latency: 'Latenz',
+        http_timeout: 'HTTP',
+        fritz_mobile: 'Fritz',
+      };
+      return labels[trigger] || (trigger || '');
     }
 
     function updateCurrentDateTime() {
@@ -131,6 +164,55 @@ INDEX_HTML = """<!doctype html>
       if (!fritzEl) return;
       fritzEl.textContent = text;
       fritzEl.style.color = color;
+    }
+
+    function updateAutoRefreshUi() {
+      const toggle = document.getElementById('auto-refresh-toggle');
+      const label = document.getElementById('auto-refresh-label');
+      if (toggle) toggle.checked = autoRefreshEnabled;
+      if (label) label.textContent = autoRefreshEnabled ? 'Refresh on' : 'Refresh off';
+    }
+
+    function loadAutoRefreshPreference() {
+      try {
+        const stored = window.localStorage.getItem(AUTO_REFRESH_STORAGE_KEY);
+        if (stored === 'true') return true;
+        if (stored === 'false') return false;
+      } catch {
+        // Ignore storage access issues and fall back to default.
+      }
+      return true;
+    }
+
+    function persistAutoRefreshPreference() {
+      try {
+        window.localStorage.setItem(AUTO_REFRESH_STORAGE_KEY, String(autoRefreshEnabled));
+      } catch {
+        // Ignore storage access issues; the toggle still works for the session.
+      }
+    }
+
+    function startAutoRefresh() {
+      if (!autoRefreshEnabled) return;
+      if (autoRefreshIntervalId !== null) return;
+      autoRefreshIntervalId = setInterval(loadData, 30000);
+    }
+
+    function stopAutoRefresh() {
+      if (autoRefreshIntervalId === null) return;
+      clearInterval(autoRefreshIntervalId);
+      autoRefreshIntervalId = null;
+    }
+
+    function setAutoRefreshEnabled(enabled) {
+      autoRefreshEnabled = !!enabled;
+      if (autoRefreshEnabled) {
+        startAutoRefresh();
+      } else {
+        stopAutoRefresh();
+      }
+      persistAutoRefreshPreference();
+      updateAutoRefreshUi();
     }
 
     async function loadFritzStatusIfNeeded(force=false) {
@@ -244,37 +326,75 @@ INDEX_HTML = """<!doctype html>
       // This avoids the "shift to the right" effect, especially on mobile.
       const xMin = times.length ? times[0] : null;
       const xMax = times.length ? times[times.length - 1] : null;
+      const tickValues = [];
+      const tickTexts = [];
+      if (xMin && xMax) {
+        const tick = new Date(xMin);
+        tick.setMinutes(0, 0, 0);
+        const hour = tick.getHours();
+        const remainder = hour % 6;
+        if (remainder !== 0) {
+          tick.setHours(hour + (6 - remainder));
+        }
+        while (tick <= xMax) {
+          tickValues.push(new Date(tick));
+          const hh = String(tick.getHours()).padStart(2, '0');
+          const mm = String(tick.getMinutes()).padStart(2, '0');
+          if (tick.getHours() === 0) {
+            const dd = String(tick.getDate()).padStart(2, '0');
+            const mo = String(tick.getMonth() + 1).padStart(2, '0');
+            tickTexts.push(`${hh}:${mm}<br>${dd}.${mo}.`);
+          } else {
+            tickTexts.push(`${hh}:${mm}`);
+          }
+          tick.setHours(tick.getHours() + 6);
+        }
+      }
       const pingColors = data.points.map(p => {
-        if (p.status === 'outage') return '#ecc94b';
-        return '#48bb78';
+        if (p.status !== 'outage') {
+          return '#48bb78';
+        }
+        if (p.connection_type === 'mobile') {
+          return '#ecc94b';
+        }
+        return '#f56565';
       });
+      const pingSizes = data.points.map(p => (p.status === 'outage' || p.connection_type === 'mobile' ? 8 : 3));
 
       const latencyTrace = {
         x: times,
         y: latencies,
         mode: 'lines+markers',
-        marker: { color: pingColors, size: 6 },
-        line: { color: '#63b3ed', width: 1 },
-        name: `Ping latency P50 (ms)  ${data.bucket_minutes} min buckets`
+        marker: { color: pingColors, size: pingSizes },
+        line: { color: '#718096', width: 1 },
+        name: `Ping latency P50 (ms)   ${data.bucket_minutes} min buckets`,
+        customdata: data.points.map(p => [
+          p.first_sample_local || '',
+          p.connection_type || 'unknown',
+          p.status || 'ok',
+          p.latency_max == null ? '—' : `${Number(p.latency_max).toFixed(1)} ms`,
+          formatTrigger(p.dsl_event_trigger) || '—',
+          p.max_mobile_duration_seconds == null ? '—' : formatDuration(p.max_mobile_duration_seconds),
+        ]),
+        hovertemplate:
+          'Zeit: %{customdata[0]}<br>' +
+          'Latenz P50: %{y:.1f} ms<br>' +
+          'Max: %{customdata[3]}<br>' +
+          'Status: %{customdata[2]}<br>' +
+          'Verbindung: %{customdata[1]}<br>' +
+          'Trigger: %{customdata[4]}<br>' +
+          'Mobile: %{customdata[5]}' +
+          '<extra></extra>'
       };
 
       // Extreme markers: only for buckets where marker_triggered==true, capped at 300ms
       const PEAK_CAP_MS = 300;
-      const maxMarkerX = [];
-      const maxMarkerY = [];
-      const maxMarkerSizes = [];
       const p95MarkerX = [];
       const p95MarkerY = [];
       const p95MarkerSizes = [];
       for (const p of data.points) {
         if (!p.marker_triggered) continue;
         const t = new Date(p.timestamp);
-        if (p.latency_max != null) {
-          const capped = p.latency_max > PEAK_CAP_MS;
-          maxMarkerX.push(t);
-          maxMarkerY.push(capped ? PEAK_CAP_MS : p.latency_max);
-          maxMarkerSizes.push(capped ? 5 : 3);
-        }
         if (p.latency_p95 != null) {
           const capped = p.latency_p95 > PEAK_CAP_MS;
           p95MarkerX.push(t);
@@ -282,14 +402,6 @@ INDEX_HTML = """<!doctype html>
           p95MarkerSizes.push(capped ? 5 : 3);
         }
       }
-
-      const maxMarkerTrace = {
-        x: maxMarkerX,
-        y: maxMarkerY,
-        mode: 'markers',
-        marker: { color: '#444', size: maxMarkerSizes, symbol: 'circle' },
-        name: 'Max (triggered)'
-      };
 
       const p95MarkerTrace = {
         x: p95MarkerX,
@@ -303,6 +415,7 @@ INDEX_HTML = """<!doctype html>
         paper_bgcolor: '#111',
         plot_bgcolor: '#111',
         font: { color: '#eee' },
+        uirevision: 'dsl-monitor',
         showlegend: true,
         legend: {
           orientation: 'h',
@@ -314,10 +427,15 @@ INDEX_HTML = """<!doctype html>
         },
         xaxis: {
           title: 'Time',
-          range: (xMin && xMax) ? [xMin, xMax] : undefined,
+          range: userZoomRange ? userZoomRange
+               : (!latencyChartInitialized && xMin && xMax) ? [xMin, xMax]
+               : undefined,
           domain: [0, 1],
           automargin: true,
           ticklabeloverflow: 'hide past domain',
+          tickmode: tickValues.length > 0 ? 'array' : 'auto',
+          tickvals: tickValues.length > 0 ? tickValues : undefined,
+          ticktext: tickTexts.length > 0 ? tickTexts : undefined,
         },
         yaxis: { title: 'Ping latency (ms)', type: 'log' },
         // Use identical margins across both plots so the plot AREA aligns.
@@ -326,20 +444,36 @@ INDEX_HTML = """<!doctype html>
       };
 
       const traces = [latencyTrace];
-      if (maxMarkerX.length > 0) traces.push(maxMarkerTrace);
       if (p95MarkerX.length > 0) traces.push(p95MarkerTrace);
-      Plotly.newPlot('latency', traces, latencyLayout, {responsive: true});
+      Plotly.react('latency', traces, latencyLayout, {responsive: true});
+      latencyChartInitialized = true;
 
-      // uirevision keeps plotly from reflowing axes in surprising ways between refreshes.
-      latencyLayout.uirevision = 'dsl-monitor';
+      // Attach zoom-tracking listener once after the chart is first created.
+      const plotEl = document.getElementById('latency');
+      if (plotEl && !plotEl._zoomListenerAttached) {
+        plotEl._zoomListenerAttached = true;
+        plotEl.on('plotly_relayout', (eventData) => {
+          const r0 = eventData['xaxis.range[0]'];
+          const r1 = eventData['xaxis.range[1]'];
+          if (r0 !== undefined && r1 !== undefined) {
+            // User zoomed or panned – remember their range.
+            userZoomRange = [r0, r1];
+          } else if (eventData['xaxis.autorange'] === true) {
+            // User double-clicked to reset – go back to full range on next refresh.
+            userZoomRange = null;
+          }
+        });
+      }
 
       const tbody = document.querySelector('#events-table tbody');
       tbody.innerHTML = '';
 
       if (data.events && data.events.length > 0) {
-        data.events.forEach((ev, idx) => {
+        data.events
+          .filter(ev => (ev.duration_seconds || 0) >= 10)
+          .forEach((ev, idx) => {
           const tr = document.createElement('tr');
-          tr.classList.add('outage');
+          tr.classList.add(ev.connection_type === 'dsl' ? 'warning' : 'outage');
 
           const tdIdx = document.createElement('td');
           tdIdx.textContent = idx + 1;
@@ -347,16 +481,20 @@ INDEX_HTML = """<!doctype html>
           const tdStart = document.createElement('td');
           tdStart.textContent = ev.start_local;
 
-          const tdEnd = document.createElement('td');
-          tdEnd.textContent = ev.end_local;
-
           const tdDur = document.createElement('td');
           tdDur.textContent = formatDuration(ev.duration_seconds);
 
+          const tdTrigger = document.createElement('td');
+          tdTrigger.textContent = formatTrigger(ev.dsl_event_trigger);
+
+          const tdMobile = document.createElement('td');
+          tdMobile.textContent = formatDuration(ev.mobile_duration_seconds);
+
           tr.appendChild(tdIdx);
           tr.appendChild(tdStart);
-          tr.appendChild(tdEnd);
           tr.appendChild(tdDur);
+          tr.appendChild(tdTrigger);
+          tr.appendChild(tdMobile);
           tbody.appendChild(tr);
         });
       }
@@ -365,11 +503,11 @@ INDEX_HTML = """<!doctype html>
     updateCurrentDateTime();
     setInterval(updateCurrentDateTime, 1000);
 
-    // Initial load
+    // Initial load (always runs once regardless of refresh setting).
     loadData();
 
-    // Refresh data (and derived statuses) every 30s.
-    setInterval(loadData, 30000);
+    // Restore auto-refresh preference and start timer only when enabled.
+    setAutoRefreshEnabled(loadAutoRefreshPreference());
 
     // NOTE: Do NOT poll Fritz in a separate 10s loop.
     // Fritz is refreshed exclusively from loadData(), and that function already
@@ -446,6 +584,13 @@ INDEX_HTML = """<!doctype html>
 
     const btn = document.getElementById('check-dsl');
     if (btn) btn.addEventListener('click', checkDslNow);
+
+    const autoRefreshToggle = document.getElementById('auto-refresh-toggle');
+    if (autoRefreshToggle) {
+      autoRefreshToggle.addEventListener('change', (event) => {
+        setAutoRefreshEnabled(event.target.checked);
+      });
+    }
   </script>
 </body>
 </html>"""
@@ -463,42 +608,13 @@ def _bucket_start(ts: datetime, minutes: int = 5) -> datetime:
     return out
 
 
-def _fetch_datasette_rows(since_utc: datetime) -> List[Dict[str, Any]]:
-    """Fetch measurement rows from a datasette JSON endpoint with pagination."""
-    all_rows: List[Dict[str, Any]] = []
-    # First request: apply retention filter and request object-shaped rows
-    next_url: str | None = None
-    resp = requests.get(
-        DATASETTE_URL,
-        params={"_shape": "objects", "_size": 1000, "timestamp__gte": since_utc.isoformat()},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    page = resp.json()
-    all_rows.extend(page.get("rows", []))
-    next_url = page.get("next_url")
-
-    # Follow pagination links until exhausted
-    while next_url:
-        resp = requests.get(next_url, timeout=15)
-        resp.raise_for_status()
-        page = resp.json()
-        all_rows.extend(page.get("rows", []))
-        next_url = page.get("next_url")
-
-    return all_rows
-
-
 def _load_raw_points() -> List[Dict[str, Any]]:
-    """Load measurement rows from datasette (if configured) or local SQLite, filtered to RETENTION_DAYS."""
+    """Load measurement rows from local SQLite, filtered to RETENTION_DAYS."""
     cutoff_utc = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
 
-    if DATASETTE_URL:
-        rows = _fetch_datasette_rows(cutoff_utc)
-    else:
-        conn = get_connection(LOG_PATH)
-        ensure_schema(conn)
-        rows = query_measurements(conn, since_utc=cutoff_utc)
+    conn = get_connection(LOG_PATH)
+    ensure_schema(conn)
+    rows = query_measurements(conn, since_utc=cutoff_utc)
 
     points: List[Dict[str, Any]] = []
     for row in rows:
@@ -518,6 +634,7 @@ def _load_raw_points() -> List[Dict[str, Any]]:
                 "connection_type": (row.get("connection_type") or "unknown").lower(),
                 "mobile_duration_seconds": row.get("mobile_duration_seconds"),
                 "dsl_event_active": bool(row.get("dsl_event_active")),
+                "dsl_event_trigger": row.get("dsl_event_trigger") or "",
             }
         )
 
@@ -563,14 +680,29 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
                 "has_outage": False,
                 "has_mobile": False,
                 "has_dsl": False,
+                "first_sample_utc": ts_utc,
+                "event_trigger": "",
+                "max_mobile_duration_seconds": None,
             },
         )
+
+        if ts_utc < b["first_sample_utc"]:
+            b["first_sample_utc"] = ts_utc
 
         if p.get("latency_ms") is not None and p.get("ping_ok"):
             b["latencies"].append(float(p["latency_ms"]))
 
         if p.get("dsl_event_active"):
             b["has_outage"] = True
+            if not b["event_trigger"]:
+                b["event_trigger"] = str(p.get("dsl_event_trigger") or "")
+
+        mobile_duration_seconds = p.get("mobile_duration_seconds")
+        if mobile_duration_seconds is not None:
+            current_mobile_max = b["max_mobile_duration_seconds"]
+            mobile_duration = float(mobile_duration_seconds)
+            if current_mobile_max is None or mobile_duration > current_mobile_max:
+                b["max_mobile_duration_seconds"] = mobile_duration
 
         ct = str(p.get("connection_type") or "unknown").lower()
         if ct == "mobile":
@@ -607,6 +739,7 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
             marker_triggered = outside_fraction >= OUTSIDE_FRACTION_THRESHOLD
 
         status = "outage" if b["has_outage"] else "ok"
+        first_sample_utc: datetime = b["first_sample_utc"]
 
         # Pick a representative connection type for the bucket.
         # If we have no Fritz info in the CSV for that bucket, we default to DSL.
@@ -620,23 +753,32 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         agg_points.append(
             {
                 "timestamp": ts.isoformat(),
+                "first_sample_utc": first_sample_utc.isoformat(),
+                "first_sample_local": first_sample_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                 "latency_ms": lat,
                 "latency_u": U,
                 "outside_fraction": outside_fraction,
                 "marker_triggered": marker_triggered,
-                "latency_max": lat_max if marker_triggered else None,
+                "latency_max": lat_max,
                 "latency_p95": (p95 if (marker_triggered and SHOW_P95_MARKER) else None),
                 "status": status,
                 "connection_type": bucket_ct,
                 "max_outage_duration_seconds": None,
-                "max_mobile_duration_seconds": None,
+                "max_mobile_duration_seconds": b["max_mobile_duration_seconds"],
+                "dsl_event_trigger": b["event_trigger"],
             }
         )
 
     return agg_points
 
 
-def _format_event(start_utc: datetime, end_utc: datetime) -> Dict[str, Any]:
+def _format_event(
+    start_utc: datetime,
+    end_utc: datetime,
+    dsl_event_trigger: str = "",
+    mobile_duration_seconds: float | None = None,
+    connection_type: str = "unknown",
+) -> Dict[str, Any]:
     duration = max(0.0, (end_utc - start_utc).total_seconds())
     start_local = start_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
     end_local = end_utc.astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -646,6 +788,9 @@ def _format_event(start_utc: datetime, end_utc: datetime) -> Dict[str, Any]:
         "start_local": start_local,
         "end_local": end_local,
         "duration_seconds": duration,
+        "dsl_event_trigger": dsl_event_trigger,
+        "mobile_duration_seconds": mobile_duration_seconds,
+        "connection_type": connection_type,
     }
 
 
@@ -655,6 +800,9 @@ def _detect_outages(raw_points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     in_evt = False
     start_ts: datetime | None = None
+    start_trigger = ""
+    event_mobile_duration_seconds: float | None = None
+    last_connection_type = "unknown"
 
     for p in raw_points:
         ts_utc: datetime = p["timestamp_utc"]
@@ -662,16 +810,28 @@ def _detect_outages(raw_points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if not in_evt:
                 in_evt = True
                 start_ts = ts_utc
+                start_trigger = str(p.get("dsl_event_trigger") or "")
+                event_mobile_duration_seconds = p.get("mobile_duration_seconds")
+                last_connection_type = str(p.get("connection_type") or "unknown").lower()
+            else:
+                if p.get("mobile_duration_seconds") is not None:
+                    event_mobile_duration_seconds = p.get("mobile_duration_seconds")
+                last_connection_type = str(p.get("connection_type") or last_connection_type or "unknown").lower()
         else:
             if in_evt and start_ts is not None:
                 end_ts = ts_utc
-                events.append(_format_event(start_ts, end_ts))
+                if p.get("mobile_duration_seconds") is not None:
+                    event_mobile_duration_seconds = p.get("mobile_duration_seconds")
+                last_connection_type = str(p.get("connection_type") or last_connection_type or "unknown").lower()
+                events.append(_format_event(start_ts, end_ts, start_trigger, event_mobile_duration_seconds, last_connection_type))
                 in_evt = False
                 start_ts = None
+                start_trigger = ""
+                event_mobile_duration_seconds = None
 
     if in_evt and start_ts is not None and raw_points:
         end_ts = raw_points[-1]["timestamp_utc"]
-        events.append(_format_event(start_ts, end_ts))
+        events.append(_format_event(start_ts, end_ts, start_trigger, event_mobile_duration_seconds, last_connection_type))
 
     events.sort(key=lambda e: e["start_utc"], reverse=True)
     return events
