@@ -205,6 +205,8 @@ def get_fritz_status() -> dict:
 
 _conn_type_last_fetch_mono: float = 0.0
 _conn_type_last_value: ConnectionType = "unknown"
+_last_snr_down_db: Optional[float] = None
+_last_snr_up_db: Optional[float] = None
 
 
 def _reset_fritz_poll_for_event() -> None:
@@ -220,8 +222,10 @@ def get_connection_type_if_outage(in_outage: bool) -> ConnectionType:
     - Normal (in_outage=False): poll every CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS (20min).
       This lets us detect dsl→mobile switches proactively.
     - Event  (in_outage=True):  poll every CONN_TYPE_POLL_INTERVAL_SECONDS (60s).
+
+    Also caches SNR margins from the same Fritz response.
     """
-    global _conn_type_last_fetch_mono, _conn_type_last_value
+    global _conn_type_last_fetch_mono, _conn_type_last_value, _last_snr_down_db, _last_snr_up_db
 
     now_mono = time.monotonic()
 
@@ -241,10 +245,20 @@ def get_connection_type_if_outage(in_outage: bool) -> ConnectionType:
             _conn_type_last_value = cast(ConnectionType, ct)
         else:
             _conn_type_last_value = "unknown"
+        snr_down = data.get("snr_down_db")
+        snr_up = data.get("snr_up_db")
+        if snr_down is not None:
+            _last_snr_down_db = float(snr_down)
+            _last_snr_up_db = float(snr_up) if snr_up is not None else None
     except Exception:
         _conn_type_last_value = "unknown"
 
     return cast(ConnectionType, _conn_type_last_value)
+
+
+def get_last_snr() -> tuple[Optional[float], Optional[float]]:
+    """Return the most recently cached SNR margins (dB), or (None, None) if not yet fetched."""
+    return _last_snr_down_db, _last_snr_up_db
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +496,7 @@ def main() -> int:
 
         conn_type: ConnectionType = state.last_connection_type
         dsl_event_dur = _dsl_event_duration_seconds(state, now_utc)
+        snr_down, snr_up = get_last_snr()
 
         # Only write trigger/end_reason when meaningful.
         row_trigger: str = state.dsl_event_trigger if (state.dsl_event_active or state.dsl_event_end_reason) else ""
@@ -503,6 +518,8 @@ def main() -> int:
             "mobile_duration_seconds": round(mobile_dur, 1) if mobile_dur is not None else None,
             "http_probe_ok": None if http_ok is None else (1 if http_ok else 0),
             "http_probe_error": http_err or "",
+            "snr_down_db": round(snr_down, 1) if snr_down is not None else None,
+            "snr_up_db": round(snr_up, 1) if snr_up is not None else None,
         }
 
         insert_measurement(db_conn, row)

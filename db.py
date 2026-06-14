@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS measurements (
     connection_type     TEXT NOT NULL DEFAULT 'unknown',
     mobile_duration_seconds REAL,
     http_probe_ok       INTEGER,
-    http_probe_error    TEXT NOT NULL DEFAULT ''
+    http_probe_error    TEXT NOT NULL DEFAULT '',
+    snr_down_db         REAL,
+    snr_up_db           REAL
 )
 """
 
@@ -56,6 +58,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create the measurements table and index if they don't exist."""
     conn.execute(_CREATE_TABLE)
     conn.execute(_CREATE_INDEX)
+    # Migrate existing databases: add SNR columns if absent.
+    for col, typedef in [("snr_down_db", "REAL"), ("snr_up_db", "REAL")]:
+        try:
+            conn.execute(f"ALTER TABLE measurements ADD COLUMN {col} {typedef}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
 
 
@@ -67,13 +75,15 @@ def insert_measurement(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
             consecutive_failures, dsl_event_active, dsl_event_trigger,
             dsl_event_duration_seconds, dsl_event_end_reason,
             connection_type, mobile_duration_seconds,
-            http_probe_ok, http_probe_error
+            http_probe_ok, http_probe_error,
+            snr_down_db, snr_up_db
         ) VALUES (
             :timestamp, :ping_target, :ping_ok, :latency_ms,
             :consecutive_failures, :dsl_event_active, :dsl_event_trigger,
             :dsl_event_duration_seconds, :dsl_event_end_reason,
             :connection_type, :mobile_duration_seconds,
-            :http_probe_ok, :http_probe_error
+            :http_probe_ok, :http_probe_error,
+            :snr_down_db, :snr_up_db
         )""",
         row,
     )

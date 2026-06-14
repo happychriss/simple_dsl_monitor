@@ -375,6 +375,8 @@ INDEX_HTML = """<!doctype html>
           p.latency_max == null ? '—' : `${Number(p.latency_max).toFixed(1)} ms`,
           formatTrigger(p.dsl_event_trigger) || '—',
           p.max_mobile_duration_seconds == null ? '—' : formatDuration(p.max_mobile_duration_seconds),
+          p.snr_down_db == null ? '—' : `${Number(p.snr_down_db).toFixed(1)} dB`,
+          p.snr_up_db   == null ? '—' : `${Number(p.snr_up_db).toFixed(1)} dB`,
         ]),
         hovertemplate:
           'Zeit: %{customdata[0]}<br>' +
@@ -383,7 +385,8 @@ INDEX_HTML = """<!doctype html>
           'Status: %{customdata[2]}<br>' +
           'Verbindung: %{customdata[1]}<br>' +
           'Trigger: %{customdata[4]}<br>' +
-          'Mobile: %{customdata[5]}' +
+          'Mobile: %{customdata[5]}<br>' +
+          'SNR ↓: %{customdata[6]}  ↑: %{customdata[7]}' +
           '<extra></extra>'
       };
 
@@ -410,6 +413,43 @@ INDEX_HTML = """<!doctype html>
         marker: { color: '#444', size: p95MarkerSizes, symbol: 'diamond' },
         name: 'P95 (triggered)'
       };
+
+      // SNR traces (sparse — only populated when Fritz was polled)
+      const snrDownVals = data.points.map(p => p.snr_down_db != null ? p.snr_down_db : null);
+      const snrUpVals   = data.points.map(p => p.snr_up_db   != null ? p.snr_up_db   : null);
+      const hasSnr = snrDownVals.some(v => v != null);
+
+      const snrDownTrace = {
+        x: times,
+        y: snrDownVals,
+        mode: 'lines+markers',
+        line: { color: '#f6ad55', width: 2 },
+        marker: { color: '#f6ad55', size: 5 },
+        name: 'SNR down (dB)',
+        yaxis: 'y2',
+        connectgaps: false,
+        hovertemplate: 'Zeit: %{x}<br>SNR down: %{y:.1f} dB<extra></extra>',
+      };
+      const snrUpTrace = {
+        x: times,
+        y: snrUpVals,
+        mode: 'lines+markers',
+        line: { color: '#76e4f7', width: 2, dash: 'dot' },
+        marker: { color: '#76e4f7', size: 5 },
+        name: 'SNR up (dB)',
+        yaxis: 'y2',
+        connectgaps: false,
+        hovertemplate: 'Zeit: %{x}<br>SNR up: %{y:.1f} dB<extra></extra>',
+      };
+
+      const snrShapes = hasSnr ? [{
+        type: 'line',
+        xref: 'paper',
+        yref: 'y2',
+        x0: 0, x1: 1,
+        y0: 6, y1: 6,
+        line: { color: '#fc8181', width: 1, dash: 'dash' },
+      }] : [];
 
       const latencyLayout = {
         paper_bgcolor: '#111',
@@ -438,13 +478,25 @@ INDEX_HTML = """<!doctype html>
           ticktext: tickTexts.length > 0 ? tickTexts : undefined,
         },
         yaxis: { title: 'Ping latency (ms)', type: 'log' },
+        yaxis2: {
+          title: 'SNR margin (dB)',
+          overlaying: 'y',
+          side: 'right',
+          range: [0, 20],
+          showgrid: false,
+          tickfont: { color: '#f6ad55' },
+          titlefont: { color: '#f6ad55' },
+          visible: hasSnr,
+        },
+        shapes: snrShapes,
         // Use identical margins across both plots so the plot AREA aligns.
         // Reserve space at the top for the legend (above plot area).
-        margin: { t: 70, r: 10, b: 40, l: 60 }
+        margin: { t: 70, r: hasSnr ? 60 : 10, b: 40, l: 60 }
       };
 
       const traces = [latencyTrace];
       if (p95MarkerX.length > 0) traces.push(p95MarkerTrace);
+      if (hasSnr) { traces.push(snrDownTrace); traces.push(snrUpTrace); }
       Plotly.react('latency', traces, latencyLayout, {responsive: true});
       latencyChartInitialized = true;
 
@@ -635,6 +687,8 @@ def _load_raw_points() -> List[Dict[str, Any]]:
                 "mobile_duration_seconds": row.get("mobile_duration_seconds"),
                 "dsl_event_active": bool(row.get("dsl_event_active")),
                 "dsl_event_trigger": row.get("dsl_event_trigger") or "",
+                "snr_down_db": row.get("snr_down_db"),
+                "snr_up_db": row.get("snr_up_db"),
             }
         )
 
@@ -683,6 +737,8 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
                 "first_sample_utc": ts_utc,
                 "event_trigger": "",
                 "max_mobile_duration_seconds": None,
+                "snr_down_values": [],
+                "snr_up_values": [],
             },
         )
 
@@ -709,6 +765,11 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
             b["has_mobile"] = True
         elif ct == "dsl":
             b["has_dsl"] = True
+
+        if p.get("snr_down_db") is not None:
+            b["snr_down_values"].append(float(p["snr_down_db"]))
+        if p.get("snr_up_db") is not None:
+            b["snr_up_values"].append(float(p["snr_up_db"]))
 
     agg_points: List[Dict[str, Any]] = []
     for ts in sorted(buckets.keys()):
@@ -750,6 +811,11 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         else:
             bucket_ct = "dsl"
 
+        snr_down_vals = b.get("snr_down_values", [])
+        snr_up_vals = b.get("snr_up_values", [])
+        snr_down_median = _percentile(sorted(snr_down_vals), 0.5) if snr_down_vals else None
+        snr_up_median = _percentile(sorted(snr_up_vals), 0.5) if snr_up_vals else None
+
         agg_points.append(
             {
                 "timestamp": ts.isoformat(),
@@ -766,6 +832,8 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
                 "max_outage_duration_seconds": None,
                 "max_mobile_duration_seconds": b["max_mobile_duration_seconds"],
                 "dsl_event_trigger": b["event_trigger"],
+                "snr_down_db": round(snr_down_median, 1) if snr_down_median is not None else None,
+                "snr_up_db": round(snr_up_median, 1) if snr_up_median is not None else None,
             }
         )
 

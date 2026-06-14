@@ -98,6 +98,39 @@ def _query_fritzbox_connection_type(fc: Any) -> tuple[ConnectionType, str]:
     return mapped, raw
 
 
+def _query_snr(fc: Any) -> dict[str, Optional[float]]:
+    """Fetch DSL SNR margin via TR-064.
+
+    Returns snr_down_db and snr_up_db in dB (float), or None if unavailable.
+    TR-064 WANDSLInterfaceConfig returns noise margin in units of 0.1 dB.
+    """
+    candidates: list[tuple[str, str]] = [
+        ("WANDSLInterfaceConfig", "GetInfo"),
+        ("WANDSLInterfaceConfig", "GetDSLInfo"),
+    ]
+    for service, action in candidates:
+        try:
+            resp = _call_action_with_variants(fc, service, action)
+        except Exception:
+            continue
+        if not isinstance(resp, dict):
+            continue
+        # Try standard TR-064 field names first, then Fritz-specific variants.
+        for key_down, key_up in [
+            ("NewDownstreamNoiseMargin", "NewUpstreamNoiseMargin"),
+            ("NewSNRMarginDown", "NewSNRMarginUp"),
+        ]:
+            if key_down in resp:
+                try:
+                    snr_down = int(resp[key_down]) / 10.0
+                    snr_up_raw = resp.get(key_up)
+                    snr_up = int(snr_up_raw) / 10.0 if snr_up_raw is not None else None
+                    return {"snr_down_db": snr_down, "snr_up_db": snr_up}
+                except (TypeError, ValueError):
+                    pass
+    return {"snr_down_db": None, "snr_up_db": None}
+
+
 def _query_dsl_sync_status(fc: Any) -> Optional[dict[str, Any]]:
     """Try to query DSL sync status via TR-064.
 
@@ -182,6 +215,8 @@ def status():
     raw_access: Optional[str] = None
     dsl_sync_up: Optional[bool] = None
     dsl_sync_source: Optional[str] = None
+    snr_down_db: Optional[float] = None
+    snr_up_db: Optional[float] = None
     error: Optional[str] = None
 
     try:
@@ -191,6 +226,9 @@ def status():
         if dsl is not None:
             dsl_sync_up = cast(Optional[bool], dsl.get("sync_up"))
             dsl_sync_source = f"{dsl.get('service')}.{dsl.get('action')}"
+        snr = _query_snr(fc)
+        snr_down_db = snr.get("snr_down_db")
+        snr_up_db = snr.get("snr_up_db")
     except Exception as exc:  # noqa: BLE001
         # Connection caching can get stale if the box drops TR-064 sessions.
         # Invalidate once so the next request can re-create a working instance.
@@ -203,6 +241,8 @@ def status():
         "raw": raw_access,
         "dsl_sync_up": dsl_sync_up,
         "dsl_sync_source": dsl_sync_source,
+        "snr_down_db": snr_down_db,
+        "snr_up_db": snr_up_db,
     }
     if error:
         payload["error"] = error
