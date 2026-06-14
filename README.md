@@ -8,20 +8,19 @@ Ein kleines DSL/Verbindungs-Monitoring.
 
 ## UI / Plots
 
-Die Web-UI zeigt zwei Plotly-Grafiken:
+Die Web-UI zeigt ein Plotly-Diagramm mit zwei überlagerten Y-Achsen:
 
-1) **Ping-Latenz (oben)** – `Plotly.newPlot('latency', …)`
-   - Zeitreihe der Ping-Latenz in konfigurierbaren Buckets (`DSL_MONITOR_BUCKET_MINUTES`, Default 5 min).
-   - Marker-Farben: **grün** = Ping OK, **rot** = Ping-Event/Outage (Bucket enthält `dsl_event_active`).
-   - Hier sieht man die Ping-Ausfälle auf einen Blick.
+**Ping-Latenz (linke Y-Achse, logarithmisch)**
+- Zeitreihe der Ping-Latenz (P50-Median) in konfigurierbaren Buckets (`DSL_MONITOR_BUCKET_MINUTES`, Default 5 min).
+- Marker-Farben: **grün** = Ping OK, **rot** = DSL-Event/Outage, **gelb** = Mobile-Fallback aktiv.
 
-2) **Status-Boxen (unten, zweite Zeile)** – `Plotly.newPlot('status', …)`
-   - Quadrate pro Zeit-Bucket als kompakte Statusanzeige der **Systemreaktion**.
-   - Drei separate Plotly-Traces (mit Legende):
-     - 🔴 **rot** (`#f56565`) = **outage** – DSL-Event im Bucket (Ping-Event oder HTTP-Timeout).
-     - 🔵 **blau** (`#63b3ed`) = **DSL** – Normalbetrieb über DSL-Verbindung. Wenn in einem Bucket kein Fritz-Status geloggt ist, wird DSL angenommen.
-     - 🟡 **gelb** (`#ecc94b`) = **mobile** – FritzBox hat auf Mobilfunk-Fallback umgeschaltet.
-   - Der User kann so im oberen Graph die Ping-Ausfälle sehen und in der Box-Zeile darunter die Systemreaktion/Status: ob Outage (rot), DSL (blau) oder Mobile-Fallback (gelb).
+**SNR-Margin (rechte Y-Achse, 0–20 dB)**
+- 🟠 **orange** = SNR downstream (dB) – Median pro Bucket.
+- 🔵 **cyan gestrichelt** = SNR upstream (dB) – Median pro Bucket.
+- 🔴 **rote gestrichelte Linie** bei 6 dB = Warnschwelle. Werte darunter sind kritisch und verursachen typischerweise Leitungs-Retrains und Verbindungsabbrüche.
+- SNR wird bei jedem Fritz-Poll in die DB geschrieben (alle 20 min im Normalbetrieb, alle 60s während eines DSL-Events). Buckets ohne Fritz-Poll-Treffer zeigen keinen SNR-Wert (Lücken in der Linie sind normal).
+
+Hover über einen Datenpunkt zeigt: Uhrzeit, Latenz P50, Max-Latenz, Status, Verbindungstyp, Trigger, Mobile-Dauer sowie SNR ↓/↑.
 
 ## Was ist ein „DSL-Event“?
 
@@ -73,6 +72,8 @@ Ein DSL-Event ist **der Zeitraum**, in dem wir aktiv Fritz-Synchron-/Verbindungs
 | `mobile_duration_seconds` | REAL | Dauer in `mobile` (NULL wenn nicht mobile) |
 | `http_probe_ok` | INTEGER | `1`/`0`/NULL (noch nie geprüft) |
 | `http_probe_error` | TEXT | z.B. `timeout` oder `HTTP 500` |
+| `snr_down_db` | REAL | DSL SNR-Margin downstream in dB (NULL wenn kein Fritz-Poll in diesem Tick) |
+| `snr_up_db` | REAL | DSL SNR-Margin upstream in dB (NULL wenn kein Fritz-Poll in diesem Tick) |
 
 ## Quickstart
 
@@ -92,8 +93,10 @@ Danach:
 ```bash
 sudo journalctl -u dsl-monitor.service -f
 
-# Fritz TR-064 Bridge direkt (sollte am zuverlässigsten sein)
+# Fritz TR-064 Bridge direkt – liefert connection_type + SNR-Werte
 curl -sS http://127.0.0.1:9077/status | jq
+# Erwartete SNR-Felder: "snr_down_db": 7.5, "snr_up_db": 9.0
+# Werte unter 6 dB downstream gelten als kritisch.
 
 # Web-Backend Proxy (das ist das, was die UI im Browser nutzt)
 curl -sS http://127.0.0.1:9076/api/fritz_status | jq
