@@ -14,10 +14,10 @@ Die Web-UI zeigt ein Plotly-Diagramm mit zwei überlagerten Y-Achsen:
 - Zeitreihe der Ping-Latenz (P50-Median) in konfigurierbaren Buckets (`DSL_MONITOR_BUCKET_MINUTES`, Default 5 min).
 - Marker-Farben: **grün** = Ping OK, **rot** = DSL-Event/Outage, **gelb** = Mobile-Fallback aktiv.
 
-**SNR-Margin (rechte Y-Achse, 0–20 dB)**
+**SNR-Margin (rechte Y-Achse, 0–20 dB) – höher ist besser**
 - 🟠 **orange** = SNR downstream (dB) – Median pro Bucket.
 - 🔵 **cyan gestrichelt** = SNR upstream (dB) – Median pro Bucket.
-- 🔴 **rote gestrichelte Linie** bei 6 dB = Warnschwelle. Werte darunter sind kritisch und verursachen typischerweise Leitungs-Retrains und Verbindungsabbrüche.
+- 🔴 **rote gestrichelte Linie** bei 6 dB = Warnschwelle. Werte darunter sind kritisch und verursachen typischerweise Leitungs-Retrains und Verbindungsabbrüche. Typisch gute Werte liegen bei 10+ dB.
 - SNR wird bei jedem Fritz-Poll in die DB geschrieben (alle 20 min im Normalbetrieb, alle 60s während eines DSL-Events). Buckets ohne Fritz-Poll-Treffer zeigen keinen SNR-Wert (Lücken in der Linie sind normal).
 
 Hover über einen Datenpunkt zeigt: Uhrzeit, Latenz P50, Max-Latenz, Status, Verbindungstyp, Trigger, Mobile-Dauer sowie SNR ↓/↑.
@@ -96,7 +96,7 @@ sudo journalctl -u dsl-monitor.service -f
 # Fritz TR-064 Bridge direkt – liefert connection_type + SNR-Werte
 curl -sS http://127.0.0.1:9077/status | jq
 # Erwartete SNR-Felder: "snr_down_db": 7.5, "snr_up_db": 9.0
-# Werte unter 6 dB downstream gelten als kritisch.
+# Höher ist besser. Unter 6 dB downstream = kritisch (Retrains wahrscheinlich).
 
 # Web-Backend Proxy (das ist das, was die UI im Browser nutzt)
 curl -sS http://127.0.0.1:9076/api/fritz_status | jq

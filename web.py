@@ -479,7 +479,7 @@ INDEX_HTML = """<!doctype html>
         },
         yaxis: { title: 'Ping latency (ms)', type: 'log' },
         yaxis2: {
-          title: 'SNR margin (dB)',
+          title: 'SNR margin (dB) — higher is better',
           overlaying: 'y',
           side: 'right',
           range: [0, 20],
