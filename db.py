@@ -35,7 +35,17 @@ CREATE TABLE IF NOT EXISTS measurements (
     http_probe_ok       INTEGER,
     http_probe_error    TEXT NOT NULL DEFAULT '',
     snr_down_db         REAL,
-    snr_up_db           REAL
+    snr_up_db           REAL,
+    ds_attenuation_db   REAL,
+    us_attenuation_db   REAL,
+    ds_curr_rate_kbps   INTEGER,
+    us_curr_rate_kbps   INTEGER,
+    link_retrains       INTEGER,
+    crc_errors          INTEGER,
+    fec_errors          INTEGER,
+    errored_secs        INTEGER,
+    severely_errored_secs INTEGER,
+    ppp_uptime_seconds  INTEGER
 )
 """
 
@@ -58,8 +68,21 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """Create the measurements table and index if they don't exist."""
     conn.execute(_CREATE_TABLE)
     conn.execute(_CREATE_INDEX)
-    # Migrate existing databases: add SNR columns if absent.
-    for col, typedef in [("snr_down_db", "REAL"), ("snr_up_db", "REAL")]:
+    # Migrate existing databases: add new columns if absent.
+    for col, typedef in [
+        ("snr_down_db", "REAL"),
+        ("snr_up_db", "REAL"),
+        ("ds_attenuation_db", "REAL"),
+        ("us_attenuation_db", "REAL"),
+        ("ds_curr_rate_kbps", "INTEGER"),
+        ("us_curr_rate_kbps", "INTEGER"),
+        ("link_retrains", "INTEGER"),
+        ("crc_errors", "INTEGER"),
+        ("fec_errors", "INTEGER"),
+        ("errored_secs", "INTEGER"),
+        ("severely_errored_secs", "INTEGER"),
+        ("ppp_uptime_seconds", "INTEGER"),
+    ]:
         try:
             conn.execute(f"ALTER TABLE measurements ADD COLUMN {col} {typedef}")
         except sqlite3.OperationalError:
@@ -69,6 +92,22 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 def insert_measurement(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
     """Insert a single measurement row."""
+    # Merge with defaults so callers don't need to supply every column.
+    full_row = {
+        "snr_down_db": None,
+        "snr_up_db": None,
+        "ds_attenuation_db": None,
+        "us_attenuation_db": None,
+        "ds_curr_rate_kbps": None,
+        "us_curr_rate_kbps": None,
+        "link_retrains": None,
+        "crc_errors": None,
+        "fec_errors": None,
+        "errored_secs": None,
+        "severely_errored_secs": None,
+        "ppp_uptime_seconds": None,
+        **row,
+    }
     conn.execute(
         """INSERT INTO measurements (
             timestamp, ping_target, ping_ok, latency_ms,
@@ -76,16 +115,26 @@ def insert_measurement(conn: sqlite3.Connection, row: Dict[str, Any]) -> None:
             dsl_event_duration_seconds, dsl_event_end_reason,
             connection_type, mobile_duration_seconds,
             http_probe_ok, http_probe_error,
-            snr_down_db, snr_up_db
+            snr_down_db, snr_up_db,
+            ds_attenuation_db, us_attenuation_db,
+            ds_curr_rate_kbps, us_curr_rate_kbps,
+            link_retrains, crc_errors, fec_errors,
+            errored_secs, severely_errored_secs,
+            ppp_uptime_seconds
         ) VALUES (
             :timestamp, :ping_target, :ping_ok, :latency_ms,
             :consecutive_failures, :dsl_event_active, :dsl_event_trigger,
             :dsl_event_duration_seconds, :dsl_event_end_reason,
             :connection_type, :mobile_duration_seconds,
             :http_probe_ok, :http_probe_error,
-            :snr_down_db, :snr_up_db
+            :snr_down_db, :snr_up_db,
+            :ds_attenuation_db, :us_attenuation_db,
+            :ds_curr_rate_kbps, :us_curr_rate_kbps,
+            :link_retrains, :crc_errors, :fec_errors,
+            :errored_secs, :severely_errored_secs,
+            :ppp_uptime_seconds
         )""",
-        row,
+        full_row,
     )
     conn.commit()
 

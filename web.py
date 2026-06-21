@@ -39,6 +39,7 @@ HTTP_PROBE_TIMEOUT_SECONDS = float(os.environ.get("DSL_MONITOR_HTTP_PROBE_TIMEOU
 
 # Fritz polling in the UI: only when an outage is active, and then max once/min.
 FRITZ_UI_POLL_INTERVAL_SECONDS = float(os.environ.get("DSL_MONITOR_FRITZ_UI_POLL_INTERVAL_SECONDS", "60"))
+DSL_LOG_URL = os.environ.get("DSL_LOG_URL", "http://127.0.0.1:9077/log")
 
 app = Flask(__name__)
 
@@ -114,6 +115,23 @@ INDEX_HTML = """<!doctype html>
             <th>Duration</th>
             <th>Trig</th>
             <th>Mobile</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="table-panel">
+      <h2 style="margin-top:0;">DSL Event Log (FritzBox)</h2>
+      <div style="margin-bottom:0.5rem; font-size:0.85rem; color:#a0aec0; display:flex; align-items:center; gap:0.75rem;">
+        <span id="fritz-log-status">—</span>
+        <button id="refresh-fritz-log" style="padding:3px 10px; background:#1a202c; color:#eee; border:1px solid #333; border-radius:4px; cursor:pointer;">Refresh</button>
+      </div>
+      <table id="fritz-log-table">
+        <thead>
+          <tr>
+            <th style="width:160px; white-space:nowrap;">Time</th>
+            <th>Event</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -310,8 +328,9 @@ INDEX_HTML = """<!doctype html>
       // Refresh Fritz status only if outageActive (rate-limited).
       loadFritzStatusIfNeeded(false);
 
-      // Also refresh HTTP probe status on every data refresh.
+      // Also refresh HTTP probe status and fritz log on every data refresh.
       loadHttpProbeStatus();
+      loadFritzLog(false);
 
       const lastEl = document.getElementById('last-updated');
       if (lastEl && data.last_updated_utc) {
@@ -369,24 +388,31 @@ INDEX_HTML = """<!doctype html>
         line: { color: '#718096', width: 1 },
         name: `Ping latency P50 (ms)   ${data.bucket_minutes} min buckets`,
         customdata: data.points.map(p => [
-          p.first_sample_local || '',
-          p.connection_type || 'unknown',
-          p.status || 'ok',
-          p.latency_max == null ? '—' : `${Number(p.latency_max).toFixed(1)} ms`,
-          formatTrigger(p.dsl_event_trigger) || '—',
-          p.max_mobile_duration_seconds == null ? '—' : formatDuration(p.max_mobile_duration_seconds),
-          p.snr_down_db == null ? '—' : `${Number(p.snr_down_db).toFixed(1)} dB`,
-          p.snr_up_db   == null ? '—' : `${Number(p.snr_up_db).toFixed(1)} dB`,
+          p.first_sample_local || '',                                                          // [0]
+          p.connection_type || 'unknown',                                                      // [1]
+          p.status || 'ok',                                                                    // [2]
+          p.latency_max == null ? '—' : `${Number(p.latency_max).toFixed(1)} ms`,             // [3]
+          formatTrigger(p.dsl_event_trigger) || '—',                                          // [4]
+          p.max_mobile_duration_seconds == null ? '—' : formatDuration(p.max_mobile_duration_seconds), // [5]
+          p.snr_down_db == null ? '—' : `${Number(p.snr_down_db).toFixed(1)} dB`,            // [6]
+          p.snr_up_db   == null ? '—' : `${Number(p.snr_up_db).toFixed(1)} dB`,              // [7]
+          p.ds_attenuation_db == null ? '—' : `${Number(p.ds_attenuation_db).toFixed(1)} dB`, // [8]
+          p.ds_curr_rate_kbps == null ? '—' : `${p.ds_curr_rate_kbps} / ${p.us_curr_rate_kbps ?? '?'} kbps`, // [9]
+          p.link_retrains_delta == null ? '—' : String(p.link_retrains_delta),               // [10]
+          p.crc_errors_delta == null ? '—' : String(p.crc_errors_delta),                     // [11]
+          p.ses_delta == null ? '—' : String(p.ses_delta),                                   // [12]
+          p.ppp_uptime_min == null ? '—' : formatDuration(p.ppp_uptime_min),                 // [13]
         ]),
         hovertemplate:
           'Zeit: %{customdata[0]}<br>' +
-          'Latenz P50: %{y:.1f} ms<br>' +
-          'Max: %{customdata[3]}<br>' +
-          'Status: %{customdata[2]}<br>' +
-          'Verbindung: %{customdata[1]}<br>' +
-          'Trigger: %{customdata[4]}<br>' +
-          'Mobile: %{customdata[5]}<br>' +
-          'SNR ↓: %{customdata[6]}  ↑: %{customdata[7]}' +
+          'Latenz P50: %{y:.1f} ms  Max: %{customdata[3]}<br>' +
+          'Status: %{customdata[2]}  Verbindung: %{customdata[1]}<br>' +
+          'Trigger: %{customdata[4]}  Mobile: %{customdata[5]}<br>' +
+          'SNR ↓: %{customdata[6]}  ↑: %{customdata[7]}<br>' +
+          'Dämpfung ↓: %{customdata[8]}<br>' +
+          'Sync: %{customdata[9]}<br>' +
+          'Retrains: %{customdata[10]}  CRC: %{customdata[11]}  SES: %{customdata[12]}<br>' +
+          'PPP Uptime min: %{customdata[13]}' +
           '<extra></extra>'
       };
 
@@ -552,11 +578,82 @@ INDEX_HTML = """<!doctype html>
       }
     }
 
+    // ---------------------------------------------------------------------------
+    // DSL Event Log panel
+    // ---------------------------------------------------------------------------
+    let fritzLogLastFetchMs = 0;
+    const FRITZ_LOG_TTL_MS = 300000; // 5 min — matches server-side cache
+
+    function logEntryClass(msg) {
+      const lower = msg.toLowerCase();
+      if (lower.includes('antwortet nicht') || lower.includes('getrennt') ||
+          lower.includes('not responding') || lower.includes('disconnect') ||
+          lower.includes('failed') || lower.includes('fehler')) {
+        return 'outage';
+      }
+      if (lower.includes('beginnt') || lower.includes('synchronisi') ||
+          lower.includes('training') || lower.includes('connecting')) {
+        return 'warning';
+      }
+      return '';
+    }
+
+    async function loadFritzLog(force) {
+      const now = Date.now();
+      if (!force && (now - fritzLogLastFetchMs) < FRITZ_LOG_TTL_MS) return;
+      fritzLogLastFetchMs = now;
+
+      const statusEl = document.getElementById('fritz-log-status');
+      if (statusEl) { statusEl.textContent = 'loading…'; statusEl.style.color = '#a0aec0'; }
+
+      try {
+        const resp = await fetch('/api/fritz_log');
+        const data = await resp.json();
+        const tbody = document.querySelector('#fritz-log-table tbody');
+        tbody.innerHTML = '';
+
+        if (data.error) {
+          if (statusEl) { statusEl.textContent = `error: ${data.error}`; statusEl.style.color = '#f56565'; }
+          return;
+        }
+
+        const entries = data.entries || [];
+        if (statusEl) {
+          statusEl.textContent = `${entries.length} events${data.cached ? ' (cached)' : ''}`;
+          statusEl.style.color = '#a0aec0';
+        }
+
+        entries.forEach(entry => {
+          const tr = document.createElement('tr');
+          const cls = logEntryClass(entry.msg || '');
+          if (cls) tr.classList.add(cls);
+
+          const tdTs = document.createElement('td');
+          tdTs.style.fontVariantNumeric = 'tabular-nums';
+          tdTs.style.whiteSpace = 'nowrap';
+          try { tdTs.textContent = new Date(entry.ts).toLocaleString(); }
+          catch { tdTs.textContent = entry.ts; }
+
+          const tdMsg = document.createElement('td');
+          tdMsg.textContent = entry.msg;
+
+          tr.appendChild(tdTs);
+          tr.appendChild(tdMsg);
+          tbody.appendChild(tr);
+        });
+      } catch(e) {
+        if (statusEl) { statusEl.textContent = 'unreachable'; statusEl.style.color = '#f56565'; }
+      }
+    }
+
+    document.getElementById('refresh-fritz-log')?.addEventListener('click', () => loadFritzLog(true));
+
     updateCurrentDateTime();
     setInterval(updateCurrentDateTime, 1000);
 
     // Initial load (always runs once regardless of refresh setting).
     loadData();
+    loadFritzLog(true);
 
     // Restore auto-refresh preference and start timer only when enabled.
     setAutoRefreshEnabled(loadAutoRefreshPreference());
@@ -689,6 +786,16 @@ def _load_raw_points() -> List[Dict[str, Any]]:
                 "dsl_event_trigger": row.get("dsl_event_trigger") or "",
                 "snr_down_db": row.get("snr_down_db"),
                 "snr_up_db": row.get("snr_up_db"),
+                "ds_attenuation_db": row.get("ds_attenuation_db"),
+                "us_attenuation_db": row.get("us_attenuation_db"),
+                "ds_curr_rate_kbps": row.get("ds_curr_rate_kbps"),
+                "us_curr_rate_kbps": row.get("us_curr_rate_kbps"),
+                "link_retrains": row.get("link_retrains"),
+                "crc_errors": row.get("crc_errors"),
+                "fec_errors": row.get("fec_errors"),
+                "errored_secs": row.get("errored_secs"),
+                "severely_errored_secs": row.get("severely_errored_secs"),
+                "ppp_uptime_seconds": row.get("ppp_uptime_seconds"),
             }
         )
 
@@ -729,7 +836,6 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         b = buckets.setdefault(
             bucket_ts,
             {
-                # Keep raw successful ping latencies for percentile/marker logic.
                 "latencies": [],
                 "has_outage": False,
                 "has_mobile": False,
@@ -739,6 +845,14 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
                 "max_mobile_duration_seconds": None,
                 "snr_down_values": [],
                 "snr_up_values": [],
+                "ds_attenuation_values": [],
+                "ds_curr_rate_values": [],
+                "us_curr_rate_values": [],
+                "link_retrains_values": [],
+                "crc_errors_values": [],
+                "fec_errors_values": [],
+                "ses_values": [],
+                "ppp_uptime_values": [],
             },
         )
 
@@ -770,6 +884,18 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
             b["snr_down_values"].append(float(p["snr_down_db"]))
         if p.get("snr_up_db") is not None:
             b["snr_up_values"].append(float(p["snr_up_db"]))
+        if p.get("ds_attenuation_db") is not None:
+            b["ds_attenuation_values"].append(float(p["ds_attenuation_db"]))
+        if p.get("ds_curr_rate_kbps") is not None:
+            b["ds_curr_rate_values"].append(int(p["ds_curr_rate_kbps"]))
+        if p.get("us_curr_rate_kbps") is not None:
+            b["us_curr_rate_values"].append(int(p["us_curr_rate_kbps"]))
+        for key in ("link_retrains", "crc_errors", "fec_errors", "severely_errored_secs"):
+            val = p.get(key)
+            if val is not None:
+                b[f"{key}_values" if key != "severely_errored_secs" else "ses_values"].append(int(val))
+        if p.get("ppp_uptime_seconds") is not None:
+            b["ppp_uptime_values"].append(int(p["ppp_uptime_seconds"]))
 
     agg_points: List[Dict[str, Any]] = []
     for ts in sorted(buckets.keys()):
@@ -816,6 +942,29 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
         snr_down_median = _percentile(sorted(snr_down_vals), 0.5) if snr_down_vals else None
         snr_up_median = _percentile(sorted(snr_up_vals), 0.5) if snr_up_vals else None
 
+        # Median for stable metrics
+        ds_att_vals = b.get("ds_attenuation_values", [])
+        ds_att_median = _percentile(sorted(ds_att_vals), 0.5) if ds_att_vals else None
+        ds_rate_vals = b.get("ds_curr_rate_values", [])
+        ds_rate_median = _percentile(sorted(ds_rate_vals), 0.5) if ds_rate_vals else None
+        us_rate_vals = b.get("us_curr_rate_values", [])
+        us_rate_median = _percentile(sorted(us_rate_vals), 0.5) if us_rate_vals else None
+
+        # Delta for cumulative counters (max - min within bucket, 0 if counter reset)
+        def _counter_delta(vals: list[int]) -> int | None:
+            if len(vals) < 2:
+                return None
+            delta = max(vals) - min(vals)
+            return delta if delta >= 0 else None
+
+        link_retrains_delta = _counter_delta(b.get("link_retrains_values", []))
+        crc_delta = _counter_delta(b.get("crc_errors_values", []))
+        fec_delta = _counter_delta(b.get("fec_errors_values", []))
+        ses_delta = _counter_delta(b.get("ses_values", []))
+
+        ppp_uptime_vals = b.get("ppp_uptime_values", [])
+        ppp_uptime_min = min(ppp_uptime_vals) if ppp_uptime_vals else None
+
         agg_points.append(
             {
                 "timestamp": ts.isoformat(),
@@ -834,6 +983,14 @@ def _aggregate_buckets(raw_points: List[Dict[str, Any]], bucket_minutes: int = 5
                 "dsl_event_trigger": b["event_trigger"],
                 "snr_down_db": round(snr_down_median, 1) if snr_down_median is not None else None,
                 "snr_up_db": round(snr_up_median, 1) if snr_up_median is not None else None,
+                "ds_attenuation_db": round(ds_att_median, 1) if ds_att_median is not None else None,
+                "ds_curr_rate_kbps": round(ds_rate_median) if ds_rate_median is not None else None,
+                "us_curr_rate_kbps": round(us_rate_median) if us_rate_median is not None else None,
+                "link_retrains_delta": link_retrains_delta,
+                "crc_errors_delta": crc_delta,
+                "fec_errors_delta": fec_delta,
+                "ses_delta": ses_delta,
+                "ppp_uptime_min": ppp_uptime_min,
             }
         )
 
@@ -1065,6 +1222,18 @@ def api_check_dsl_now():
             "checked_utc": datetime.now(timezone.utc).isoformat(),
         }
     )
+
+
+@app.route("/api/fritz_log")
+def api_fritz_log():
+    """Proxy the FritzBox event log from the fritz status bridge (cached 5 min there)."""
+    try:
+        req = urllib.request.Request(DSL_LOG_URL)
+        with urllib.request.urlopen(req, timeout=FRITZ_STATUS_TIMEOUT_SECONDS) as resp:
+            raw = resp.read()
+        return jsonify(json.loads(raw.decode("utf-8")))
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"entries": [], "error": str(exc)})
 
 
 def main() -> int:

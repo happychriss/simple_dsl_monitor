@@ -207,6 +207,16 @@ _conn_type_last_fetch_mono: float = 0.0
 _conn_type_last_value: ConnectionType = "unknown"
 _last_snr_down_db: Optional[float] = None
 _last_snr_up_db: Optional[float] = None
+_last_ds_attenuation_db: Optional[float] = None
+_last_us_attenuation_db: Optional[float] = None
+_last_ds_curr_rate_kbps: Optional[int] = None
+_last_us_curr_rate_kbps: Optional[int] = None
+_last_link_retrains: Optional[int] = None
+_last_crc_errors: Optional[int] = None
+_last_fec_errors: Optional[int] = None
+_last_errored_secs: Optional[int] = None
+_last_severely_errored_secs: Optional[int] = None
+_last_ppp_uptime_seconds: Optional[int] = None
 
 
 def _reset_fritz_poll_for_event() -> None:
@@ -220,19 +230,20 @@ def get_connection_type_if_outage(in_outage: bool) -> ConnectionType:
 
     Two modes:
     - Normal (in_outage=False): poll every CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS (20min).
-      This lets us detect dsl→mobile switches proactively.
     - Event  (in_outage=True):  poll every CONN_TYPE_POLL_INTERVAL_SECONDS (60s).
 
-    Also caches SNR margins from the same Fritz response.
+    Caches all Fritz metrics (SNR, attenuation, sync rates, error counters, PPP uptime).
     """
-    global _conn_type_last_fetch_mono, _conn_type_last_value, _last_snr_down_db, _last_snr_up_db
+    global _conn_type_last_fetch_mono, _conn_type_last_value
+    global _last_snr_down_db, _last_snr_up_db
+    global _last_ds_attenuation_db, _last_us_attenuation_db
+    global _last_ds_curr_rate_kbps, _last_us_curr_rate_kbps
+    global _last_link_retrains, _last_crc_errors, _last_fec_errors
+    global _last_errored_secs, _last_severely_errored_secs
+    global _last_ppp_uptime_seconds
 
     now_mono = time.monotonic()
-
-    if in_outage:
-        interval = float(CONN_TYPE_POLL_INTERVAL_SECONDS)
-    else:
-        interval = float(CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS)
+    interval = float(CONN_TYPE_POLL_INTERVAL_SECONDS if in_outage else CONN_TYPE_NORMAL_POLL_INTERVAL_SECONDS)
 
     if (now_mono - _conn_type_last_fetch_mono) < interval:
         return cast(ConnectionType, _conn_type_last_value)
@@ -241,15 +252,28 @@ def get_connection_type_if_outage(in_outage: bool) -> ConnectionType:
     try:
         data = get_fritz_status()
         ct = str(data.get("connection_type", "unknown")).lower()
-        if ct in {"dsl", "mobile", "unknown"}:
-            _conn_type_last_value = cast(ConnectionType, ct)
-        else:
-            _conn_type_last_value = "unknown"
-        snr_down = data.get("snr_down_db")
-        snr_up = data.get("snr_up_db")
-        if snr_down is not None:
-            _last_snr_down_db = float(snr_down)
-            _last_snr_up_db = float(snr_up) if snr_up is not None else None
+        _conn_type_last_value = cast(ConnectionType, ct) if ct in {"dsl", "mobile", "unknown"} else "unknown"
+
+        def _float(key: str) -> Optional[float]:
+            v = data.get(key)
+            return float(v) if v is not None else None
+
+        def _int(key: str) -> Optional[int]:
+            v = data.get(key)
+            return int(v) if v is not None else None
+
+        _last_snr_down_db = _float("snr_down_db")
+        _last_snr_up_db = _float("snr_up_db")
+        _last_ds_attenuation_db = _float("ds_attenuation_db")
+        _last_us_attenuation_db = _float("us_attenuation_db")
+        _last_ds_curr_rate_kbps = _int("ds_curr_rate_kbps")
+        _last_us_curr_rate_kbps = _int("us_curr_rate_kbps")
+        _last_link_retrains = _int("link_retrains")
+        _last_crc_errors = _int("crc_errors")
+        _last_fec_errors = _int("fec_errors")
+        _last_errored_secs = _int("errored_secs")
+        _last_severely_errored_secs = _int("severely_errored_secs")
+        _last_ppp_uptime_seconds = _int("ppp_uptime_seconds")
     except Exception:
         _conn_type_last_value = "unknown"
 
@@ -259,6 +283,22 @@ def get_connection_type_if_outage(in_outage: bool) -> ConnectionType:
 def get_last_snr() -> tuple[Optional[float], Optional[float]]:
     """Return the most recently cached SNR margins (dB), or (None, None) if not yet fetched."""
     return _last_snr_down_db, _last_snr_up_db
+
+
+def get_last_dsl_stats() -> dict:
+    """Return all most-recently cached Fritz metrics."""
+    return {
+        "ds_attenuation_db": _last_ds_attenuation_db,
+        "us_attenuation_db": _last_us_attenuation_db,
+        "ds_curr_rate_kbps": _last_ds_curr_rate_kbps,
+        "us_curr_rate_kbps": _last_us_curr_rate_kbps,
+        "link_retrains": _last_link_retrains,
+        "crc_errors": _last_crc_errors,
+        "fec_errors": _last_fec_errors,
+        "errored_secs": _last_errored_secs,
+        "severely_errored_secs": _last_severely_errored_secs,
+        "ppp_uptime_seconds": _last_ppp_uptime_seconds,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +537,7 @@ def main() -> int:
         conn_type: ConnectionType = state.last_connection_type
         dsl_event_dur = _dsl_event_duration_seconds(state, now_utc)
         snr_down, snr_up = get_last_snr()
+        dsl_stats = get_last_dsl_stats()
 
         # Only write trigger/end_reason when meaningful.
         row_trigger: str = state.dsl_event_trigger if (state.dsl_event_active or state.dsl_event_end_reason) else ""
@@ -520,6 +561,16 @@ def main() -> int:
             "http_probe_error": http_err or "",
             "snr_down_db": round(snr_down, 1) if snr_down is not None else None,
             "snr_up_db": round(snr_up, 1) if snr_up is not None else None,
+            "ds_attenuation_db": round(dsl_stats["ds_attenuation_db"], 1) if dsl_stats["ds_attenuation_db"] is not None else None,
+            "us_attenuation_db": round(dsl_stats["us_attenuation_db"], 1) if dsl_stats["us_attenuation_db"] is not None else None,
+            "ds_curr_rate_kbps": dsl_stats["ds_curr_rate_kbps"],
+            "us_curr_rate_kbps": dsl_stats["us_curr_rate_kbps"],
+            "link_retrains": dsl_stats["link_retrains"],
+            "crc_errors": dsl_stats["crc_errors"],
+            "fec_errors": dsl_stats["fec_errors"],
+            "errored_secs": dsl_stats["errored_secs"],
+            "severely_errored_secs": dsl_stats["severely_errored_secs"],
+            "ppp_uptime_seconds": dsl_stats["ppp_uptime_seconds"],
         }
 
         insert_measurement(db_conn, row)
