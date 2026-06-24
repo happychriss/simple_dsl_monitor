@@ -2,6 +2,10 @@
 """One-time migration: copy all rows from dsl_log.db (SQLite) into PostgreSQL.
 
 Run from the project directory after updating .env with DB_HOST/DB_NAME/DB_USER/DB_PASSWORD.
+
+Usage:
+  python3 migrate_sqlite_to_postgres.py           # append, skip duplicates
+  python3 migrate_sqlite_to_postgres.py --clean   # TRUNCATE first, then migrate
 """
 
 import os
@@ -51,6 +55,8 @@ BATCH_SIZE = 500
 
 
 def main() -> int:
+    clean = "--clean" in sys.argv
+
     if not os.path.exists(SQLITE_PATH):
         print(f"SQLite file not found: {SQLITE_PATH}", file=sys.stderr)
         return 1
@@ -87,7 +93,18 @@ def main() -> int:
         existing = cur.fetchone()[0]
     print(f"PostgreSQL already contains {existing} rows.")
 
-    if existing > 0:
+    if clean:
+        if existing > 0:
+            answer = input(f"--clean will DELETE all {existing} existing rows. Continue? [y/N] ").strip().lower()
+            if answer != "y":
+                print("Aborted.")
+                pg_conn.close()
+                return 0
+            with pg_conn.cursor() as cur:
+                cur.execute("TRUNCATE measurements")
+            pg_conn.commit()
+            print(f"Truncated {existing} rows.")
+    elif existing > 0:
         answer = input("Rows already exist. Proceed anyway (duplicates skipped)? [y/N] ").strip().lower()
         if answer != "y":
             print("Aborted.")
