@@ -12,6 +12,7 @@ venv/
 # Logs / runtime files
 .dsl_log.csv*
 dsl_log.csv*
+dsl_log.db*
 *.log
 
 # IDE

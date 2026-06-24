@@ -758,12 +758,15 @@ def _bucket_start(ts: datetime, minutes: int = 5) -> datetime:
 
 
 def _load_raw_points() -> List[Dict[str, Any]]:
-    """Load measurement rows from local SQLite, filtered to RETENTION_DAYS."""
+    """Load measurement rows from PostgreSQL, filtered to RETENTION_DAYS."""
     cutoff_utc = datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)
 
     conn = get_connection(LOG_PATH)
-    ensure_schema(conn)
-    rows = query_measurements(conn, since_utc=cutoff_utc)
+    try:
+        ensure_schema(conn)
+        rows = query_measurements(conn, since_utc=cutoff_utc)
+    finally:
+        conn.close()
 
     points: List[Dict[str, Any]] = []
     for row in rows:
